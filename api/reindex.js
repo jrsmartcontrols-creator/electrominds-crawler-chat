@@ -1,178 +1,139 @@
 // /api/reindex.js
-import { load as cheerioLoad } from "cheerio";
-import { parseStringPromise } from "xml2js";
+// Node 22, ESM. Indexa productos: title + url + group. Sin imágenes.
+// Fuente: sitemap de tu Wix. Concurrency baja para evitar timeouts en Vercel Hobby.
 
-// --- CONFIG ---
-const BASE = "https://www.electrominds.com.co";
-const SITEMAP_INDEX = `${BASE}/sitemap.xml`;
-const HUMAN_WHATSAPP =
-  "https://wa.me/573203440092?text=Hola%20Electrominds,%20necesito%20asesor%20🙂";
+export const config = { runtime: "nodejs" };
 
-// cache en memoria de la función serverless
-const CACHE_KEY = "__EM_INDEX__";
-const MAX_DEFAULT = 120; // puedes subirlo si ves que responde bien
+const SITE = "https://www.electrominds.com.co";
+const SITEMAP_INDEX = `${SITE}/sitemap.xml`;
+const WA_NUMBER = "573203440092"; // <-- WhatsApp de Electrominds
 
-// --- util: fetch con timeout y fallback ---
-async function fetchText(url, timeoutMs = 15000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { signal: ctrl.signal, headers: { "user-agent": "Mozilla/5.0" } });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.text();
-  } finally {
-    clearTimeout(t);
-  }
+function cors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-// --- util: limitador de concurrencia ---
-async function mapLimit(items, limit, mapper) {
-  const out = [];
-  let i = 0, active = 0, rej;
-  return new Promise((resolve, reject) => {
-    rej = reject;
-    const next = () => {
-      if (i >= items.length && active === 0) return resolve(out);
-      while (active < limit && i < items.length) {
-        const idx = i++;
-        active++;
-        Promise.resolve(mapper(items[idx], idx))
-          .then(v => out[idx] = v)
-          .catch(e => { /* no frenamos todo, sólo log */ console.error(e); out[idx] = null; })
-          .finally(() => { active--; next(); });
-      }
-    };
-    next();
-  });
+async function fetchText(url) {
+  const r = await fetch(url, { headers: { "User-Agent": "ElectromindsBot/1.0" } });
+  if (!r.ok) throw new Error(`Fetch ${url} -> ${r.status}`);
+  return await r.text();
 }
 
-// --- categorizar para “grupos” simples ---
-function categorize(text) {
-  const s = text.toLowerCase();
-  if (s.includes("arduino")) return "arduino";
-  if (s.includes("raspberry")) return "raspberry";
-  if (s.includes("sensor")) return "sensor";
-  if (s.includes("interruptor") || s.includes("sonoff") || s.includes("wifi")) return "interruptor wifi";
-  if (s.includes("vga") || s.includes("cable")) return "cables vga";
-  return "otros";
-}
-
-// --- lee el sitemap index y devuelve los sitemaps hijos ---
-async function listChildSitemaps() {
-  const xml = await fetchText(SITEMAP_INDEX);
-  const parsed = await parseStringPromise(xml);
-  const entries = parsed?.sitemapindex?.sitemap || [];
-  const locs = entries.map(e => e.loc?.[0]).filter(Boolean);
-
-  // priorizamos los que suelen traer productos / páginas de producto
-  // pero admitimos todos por si Wix cambió nombres
+function extractLocs(xml) {
+  // Extrae <loc>...</loc> con regex simple
+  const locs = [];
+  const re = /<loc>(.*?)<\/loc>/g;
+  let m;
+  while ((m = re.exec(xml))) locs.push(m[1].trim());
   return locs;
 }
 
-// --- de un sitemap (xml) saca las URLs ---
-async function urlsFromSitemap(sitemapUrl) {
-  try {
-    const xml = await fetchText(sitemapUrl);
-    const parsed = await parseStringPromise(xml);
-    const urlset = parsed?.urlset?.url || [];
-    return urlset.map(u => u.loc?.[0]).filter(Boolean);
-  } catch {
-    return [];
-  }
+function classifyGroup(title, url) {
+  const t = `${title} ${url}`.toLowerCase();
+  if (t.includes("arduino")) return "arduino";
+  if (t.includes("raspberry")) return "raspberry";
+  if (t.includes("sensor")) return "sensor";
+  if (t.includes("interruptor") || t.includes("wifi")) return "interruptor wifi";
+  if (t.includes("cable") || t.includes("vga") || t.includes("rj45") || t.includes("cat")) return "cables";
+  return "otros";
 }
 
-// --- extrae info básica de una página de producto ---
-async function scrapeProduct(url) {
-  try {
-    const html = await fetchText(url, 12000);
-    const $ = cheerioLoad(html);
-
-    // og:title suele ser muy fiable en Wix
-    const ogTitle = $('meta[property="og:title"]').attr("content");
-    const h1 = $("h1").first().text();
-    const title = (ogTitle || h1 || "").trim();
-
-    if (!title) return null; // si no hay título, descartamos
-
-    // una descripción corta para mejorar la búsqueda (no se muestra)
-    const ogDesc = $('meta[property="og:description"]').attr("content") || "";
-    const text = `${title} ${ogDesc}`.trim();
-
-    return {
-      title,
-      url,
-      text,
-      group: categorize(text),
-    };
-  } catch {
-    return null;
-  }
+function pickTitle(html) {
+  // 1) og:title
+  let m = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
+  if (m) return decodeHTMLEntities(m[1]);
+  // 2) <title>
+  m = html.match(/<title>([^<]+)<\/title>/i);
+  if (m) return decodeHTMLEntities(m[1]);
+  return null;
+}
+function decodeHTMLEntities(s) {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"');
 }
 
-// --- construir índice, con tope "max" ---
-async function buildIndex(max = MAX_DEFAULT) {
-  const sitemaps = await listChildSitemaps();
-
-  // juntamos URLs de sitemaps en paralelo moderado
-  const urlLists = await mapLimit(sitemaps, 4, urlsFromSitemap);
-  let urls = urlLists.flat().filter(Boolean);
-
-  // nos quedamos con posibles productos
-  urls = urls.filter(u =>
-    u.includes("/product") || u.includes("/product-page") || u.includes("/store")
+async function buildIndex({ max = 120 } = {}) {
+  // 1) lee sitemap index y queda con los sitemaps reales
+  const root = await fetchText(SITEMAP_INDEX);
+  const maps = extractLocs(root).filter((u) =>
+    /sitemap\.xml|posts-sitemap\.xml|pages-sitemap\.xml|products-sitemap\.xml|store|forum|pages/i.test(u)
+  );
+  // 2) junta URLs de páginas
+  let urls = [];
+  for (const sm of maps) {
+    try {
+      const xml = await fetchText(sm);
+      const locs = extractLocs(xml).filter((u) => u.startsWith("http"));
+      urls.push(...locs);
+    } catch (e) {
+      // sigue
+    }
+  }
+  // filtra URLs “no producto” obvios; deja pages también por si tienes fichas en “product-page”
+  urls = urls.filter((u) =>
+    /(product-page|store|product|pages|blog|post|forum|electrominds)/i.test(u)
   );
 
-  // quitamos duplicados y recortamos a "max"
-  const seen = new Set();
-  const uniq = [];
-  for (const u of urls) {
-    if (!seen.has(u)) { seen.add(u); uniq.push(u); }
-    if (uniq.length >= max) break;
+  // cap
+  if (urls.length > max) urls = urls.slice(0, max);
+
+  // 3) scrapea títulos con baja concurrencia
+  const docs = [];
+  const CONC = 4;
+  let i = 0;
+
+  async function worker() {
+    while (i < urls.length) {
+      const url = urls[i++];
+      try {
+        const html = await fetchText(url);
+        const title = pickTitle(html);
+        if (!title) continue;
+        docs.push({
+          title: title.trim(),
+          url,
+          group: classifyGroup(title, url)
+        });
+      } catch (_) {
+        // ignora errores individuales
+      }
+    }
   }
+  await Promise.all(Array.from({ length: CONC }, worker));
 
-  // scrapeamos en paralelo moderado
-  const docs = (await mapLimit(uniq, 6, scrapeProduct)).filter(Boolean);
-
-  return {
-    ok: true,
-    count: docs.length,
+  // guarda en memoria global (compartido por /api/ask si corre en el mismo runtime)
+  globalThis.__electrominds_index = {
     docs,
-    taken: uniq.length,
     updatedAt: Date.now(),
+    contact_url: `https://wa.me/${WA_NUMBER}?text=` +
+      encodeURIComponent("Hola Electrominds, necesito asesor 😊"),
   };
+
+  return { count: docs.length, sitemapCount: maps.length, taken: urls.length };
 }
 
-// --- acceso a cache global (se regenera sola si está vacía) ---
-async function getIndex(force, max) {
-  if (!globalThis[CACHE_KEY]) globalThis[CACHE_KEY] = { docs: [], updatedAt: 0 };
-  const cached = globalThis[CACHE_KEY];
-
-  if (force || !cached.docs?.length) {
-    const idx = await buildIndex(max);
-    globalThis[CACHE_KEY] = idx;
-  }
-  return globalThis[CACHE_KEY];
-}
-
-// --- handler HTTP ---
 export default async function handler(req, res) {
+  cors(res);
+  if (req.method === "OPTIONS") return res.status(200).end();
+
+  const url = new URL(req.url, "http://localhost");
+  const max = Math.max(20, Math.min(200, Number(url.searchParams.get("max") || 120)));
+
   try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const max = Math.max(10, Math.min(1000, Number(url.searchParams.get("max")) || MAX_DEFAULT));
-    const force = true; // siempre forzamos cuando se llama /reindex
-
-    const idx = await getIndex(force, max);
-
-    res.status(200).json({
+    const stats = await buildIndex({ max });
+    const idx = globalThis.__electrominds_index || { docs: [] };
+    return res.status(200).json({
       ok: true,
-      count: idx.count || 0,
-      sitemapCount: undefined, // ya no reportamos hijos; no hace falta
-      taken: idx.taken || 0,
-      updatedAt: idx.updatedAt,
-      sample: idx.docs.slice(0, 3).map(d => ({ title: d.title, url: d.url, group: d.group })),
+      ...stats,
+      sample: idx.docs.slice(0, 3),
+      updatedAt: idx.updatedAt
     });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: "crawler_failed" });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e.message || e) });
   }
 }
