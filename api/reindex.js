@@ -1,205 +1,221 @@
-// api/reindex.js
-// ----------------------------------------------------
-// 1) Reindexa la web de Electrominds leyendo el sitemap.
-// 2) Guarda un índice en memoria del proceso actual.
-// 3) Exporta getIndex/queryIndex/hydrateIndex para /api/ask.
-// 4) Incluye CORS.
-// ----------------------------------------------------
+// /api/reindex.js
+// Reindexa el sitio de Electrominds (Wix) leyendo el sitemap y cada página de producto.
+// Extrae: título, precio (si existe), descripción breve, imagen y breadcrumbs (categorías).
+// Guarda todo en memoria (global) para que /api/ask.js consulte rápido.
 
-/* --------------------------- CORS --------------------------- */
-function setCORS(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-}
+export const config = { runtime: "edge" };
 
-/* --------------------- Índice en memoria -------------------- */
+const DOMAIN = "https://www.electrominds.com.co";
+const SITEMAP_URL = `${DOMAIN}/sitemap.xml`;
+
+// Memoria en frío (se comparte entre invocaciones mientras la función se mantenga viva)
 function getStore() {
-  if (!globalThis.EM_INDEX) {
-    globalThis.EM_INDEX = { docs: [], updatedAt: 0 };
+  globalThis.__EM_STORE__ ??= { docs: [], updatedAt: 0, byUrl: new Map() };
+  return globalThis.__EM_STORE__;
+}
+
+// Utilidades
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+
+async function fetchText(url, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const r = await fetch(url, { headers: { "user-agent": "ElectromindsBot/1.0" } });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return await r.text();
+    } catch (e) {
+      if (i === retries) throw e;
+      await sleep(300 + 300 * i);
+    }
   }
-  return globalThis.EM_INDEX;
 }
 
-export function getIndex() {
-  return getStore();
+function pickMeta(html, prop, by = "property") {
+  const re = new RegExp(`<meta[^>]*${by}\\s*=\\s*["']${prop}["'][^>]*content=["']([^"']+)["'][^>]*>`, "i");
+  const m = html.match(re);
+  return m?.[1]?.trim() || "";
 }
 
-function saveIndex(docs) {
-  const store = getStore();
-  store.docs = docs || [];
-  store.updatedAt = Date.now();
-  return store;
+function stripTags(s = "") {
+  return s.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
-export function hydrateIndex(docs) {
-  return saveIndex(Array.isArray(docs) ? docs : []);
-}
-
-/* --------------------- Utilidades crawling ------------------ */
-const SITE = "https://www.electrominds.com.co";
-const MAIN_SITEMAP = `${SITE}/sitemap.xml`;
-
-function pLimit(n) {
-  const q = [];
-  let a = 0;
-  const next = () => { a--; if (q.length) q.shift()(); };
-  return fn => new Promise((resolve, reject) => {
-    const run = () => {
-      a++;
-      Promise.resolve().then(fn).then(v => { next(); resolve(v); })
-        .catch(e => { next(); reject(e); });
-    };
-    if (a < n) run(); else q.push(run);
-  });
-}
-
-function textBetween(s, a, b) {
-  const i = s.indexOf(a); if (i === -1) return "";
-  const j = s.indexOf(b, i + a.length); if (j === -1) return "";
-  return s.slice(i + a.length, j);
-}
-function cleanText(s) {
-  return String(s || "").replace(/\s+/g, " ").replace(/<[^>]+>/g, " ").trim();
-}
-function unique(arr) { return Array.from(new Set(arr)); }
-
-/* ----------- Parseo sencillo de XML (tags <loc>) ------------ */
-function extractLocs(xml) {
+function parseJSONLDAll(html) {
   const out = [];
-  const re = /<loc>([^<]+)<\/loc>/gi; let m;
-  while ((m = re.exec(xml))) out.push(m[1].trim());
-  return unique(out);
+  const rx = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = rx.exec(html))) {
+    try {
+      const json = JSON.parse(m[1]);
+      if (Array.isArray(json)) out.push(...json);
+      else out.push(json);
+    } catch {}
+  }
+  return out;
 }
 
-/* -------------- Detección de URLs de producto --------------- */
-function isProductUrl(u) {
-  return (
-    u.includes("/product-page/") ||
-    u.includes("/store-products") ||
-    u.includes("/product/")
+function parseBreadcrumbs(html) {
+  const cats = [];
+  const nodes = parseJSONLDAll(html);
+  for (const node of nodes) {
+    if (node?.["@type"] === "BreadcrumbList" && Array.isArray(node.itemListElement)) {
+      node.itemListElement.forEach(li => {
+        const name = li?.item?.name || li?.name;
+        if (name) cats.push(String(name));
+      });
+    }
+  }
+  return [...new Set(cats)];
+}
+
+function parseProductJSONLD(html) {
+  const nodes = parseJSONLDAll(html);
+  for (const node of nodes) {
+    if (node?.["@type"] === "Product") return node;
+  }
+  return null;
+}
+
+function parseProduct(html, url) {
+  // Título
+  let title = pickMeta(html, "og:title") || pickMeta(html, "twitter:title") || stripTags((html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]) || "");
+  title = title.replace(/\s*\|\s*Electrominds\s*$/i, "").trim() || "Producto";
+
+  // Descripción / texto
+  let text = pickMeta(html, "description", "name") || pickMeta(html, "og:description") || "";
+  if (!text) {
+    const m = html.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
+    text = stripTags(m?.[1] || "");
+  }
+
+  // Imagen
+  let image = pickMeta(html, "og:image") || pickMeta(html, "twitter:image");
+
+  // Precio (si existe)
+  let price = null;
+
+  // JSON-LD Product
+  const pld = parseProductJSONLD(html);
+  if (pld) {
+    if (!title && pld.name) title = String(pld.name);
+    if (!image && pld.image) image = Array.isArray(pld.image) ? pld.image[0] : pld.image;
+    if (!text && pld.description) text = String(pld.description);
+    const offers = Array.isArray(pld.offers) ? pld.offers[0] : pld.offers;
+    if (offers?.price) price = String(offers.price);
+  }
+
+  // Breadcrumbs → categorías
+  const cats = parseBreadcrumbs(html);
+
+  return { url, title, text, price, image, cats };
+}
+
+function extractLocsFromSitemap(xml) {
+  // Toma <loc>...</loc> de sitemaps o sitemapindex
+  const locs = [...xml.matchAll(/<loc>\s*([^<]+)\s*<\/loc>/gi)].map(m => m[1].trim());
+
+  // Filtra URLs de productos (Wix suele usar /product-page/)
+  return locs.filter(u =>
+    /\/product-page\//i.test(u) || /store-products/i.test(u) || /pages-sitemap/i.test(u)
   );
 }
 
-/* --------- Extracción de datos desde HTML de producto -------- */
-function parseProduct(html, url) {
-  let title =
-    textBetween(html, '<meta property="og:title" content="', '"') ||
-    textBetween(html, "<title>", "</title>");
-  title = cleanText(title);
+async function getAllProductUrls() {
+  const xml = await fetchText(SITEMAP_URL);
+  const locs = extractLocsFromSitemap(xml);
 
-  const desc = textBetween(html, '<meta name="description" content="', '"') || "";
-  let text = cleanText(desc);
+  // Si el sitemap principal es un índice, cada loc es otro sitemap → expandimos
+  const productUrls = [];
+  if (locs.some(u => /sitemap\.xml$/i.test(u) || /sitemap/i.test(u))) {
+    for (const sm of locs) {
+      try {
+        const x = await fetchText(sm);
+        const urls = extractLocsFromSitemap(x);
+        productUrls.push(...urls);
+      } catch {}
+    }
+  } else {
+    productUrls.push(...locs);
+  }
 
-  let price = "";
-  const ld = [...html.matchAll(/<script[^>]*type="application\/ld\+json"[^>]*>([\s\S]*?)<\/script>/gi)];
-  for (const m of ld) {
-    try {
-      const json = JSON.parse(m[1]);
-      const nodes = Array.isArray(json) ? json : [json];
-      for (const node of nodes) {
-        if (node && (node["@type"] === "Product" || (Array.isArray(node["@type"]) && node["@type"].includes("Product")))) {
-          if (node.description && !text) text = cleanText(node.description);
-          const offers = node.offers || node.Offer || node.offer;
-          const p = (offers && (offers.price || offers.lowPrice)) || node.price;
-          if (p) price = String(p);
+  // Quitar duplicados y quedarnos solo con Electrominds
+  return [...new Set(productUrls.filter(u => u.startsWith(DOMAIN)))];
+}
+
+async function reindex(max = 400) {
+  const store = getStore();
+  const urls = await getAllProductUrls();
+  const target = urls.slice(0, max);
+
+  // Concurrency simple
+  const CONC = 6;
+  let i = 0, ok = 0;
+  const t0 = Date.now();
+
+  const run = async () => {
+    while (i < target.length) {
+      const url = target[i++];
+      try {
+        const html = await fetchText(url);
+        const doc = parseProduct(html, url);
+        if (doc?.title) {
+          store.byUrl.set(url, doc);
+          ok++;
         }
-      }
-    } catch { /* ignore */ }
-  }
+        // Suavizar crawl
+        await sleep(60);
+      } catch {}
+    }
+  };
 
-  return { title: title || "Producto", url, price: price || null, text };
+  const workers = Array.from({ length: CONC }, run);
+  await Promise.all(workers);
+
+  store.docs = [...store.byUrl.values()];
+  store.updatedAt = Date.now();
+  return { count: store.docs.length, ok, taken: Date.now() - t0, sitemapCount: urls.length };
 }
 
-/* ------------------------ Crawler --------------------------- */
-async function fetchText(url) {
-  const r = await fetch(url, { redirect: "follow" });
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${url}`);
-  return await r.text();
-}
-
-async function crawlSitemaps(maxPages = 200) {
-  const root = await fetchText(MAIN_SITEMAP);
-  const all = extractLocs(root);
-
-  const sitemapUrls = [];
-  const pageUrls = [];
-  for (const loc of all) {
-    if (loc.endsWith(".xml")) sitemapUrls.push(loc);
-    else pageUrls.push(loc);
-  }
-
-  for (const sm of sitemapUrls) {
-    try {
-      const xml = await fetchText(sm);
-      extractLocs(xml).forEach(u => pageUrls.push(u));
-    } catch {}
-  }
-
-  const products = unique(pageUrls.filter(isProductUrl)).slice(0, maxPages);
-
-  const limit = pLimit(6);
-  const docs = [];
-  await Promise.allSettled(products.map(u => limit(async () => {
-    try {
-      const html = await fetchText(u);
-      docs.push(parseProduct(html, u));
-    } catch {}
-  })));
-
-  return { docs, sitemapCount: sitemapUrls.length + 1 };
-}
-
-/* ---------------------- Búsqueda simple --------------------- */
-function scoreDoc(doc, q) {
-  const lc = q.toLowerCase();
-  const has = s => s && s.toLowerCase().includes(lc);
-  let s = 0;
-  if (has(doc.title)) s += 2;
-  if (has(doc.text)) s += 1;
-  if (has(doc.url)) s += 0.5;
-  return s;
-}
-
-export function queryIndex(query) {
-  const q = String(query || "").trim();
-  if (!q) return [];
-  const { docs } = getStore();
-  return docs
-    .map(d => ({ ...d, _score: scoreDoc(d, q) }))
-    .filter(d => d._score > 0)
-    .sort((a, b) => b._score - a._score);
-}
-
-/* ------------------------- Handler -------------------------- */
-export default async function handler(req, res) {
-  setCORS(res);
-  if (req.method === "OPTIONS") return res.status(204).end();
-
+export default async function handler(req) {
   try {
-    const max  = Math.max(1, Math.min(parseInt(req.query?.max ?? "200", 10) || 200, 1000));
-    const full = String(req.query?.full ?? "0") === "1";
+    const { searchParams } = new URL(req.url);
+    const full = searchParams.get("full") === "1" || searchParams.get("full") === "true";
+    const max = clamp(parseInt(searchParams.get("max") || "400", 10) || 400, 1, 2000);
 
-    const { docs, sitemapCount } = await crawlSitemaps(max);
-    const store = saveIndex(docs);
+    if (full) {
+      // Limpia y reindexa desde cero
+      globalThis.__EM_STORE__ = { docs: [], updatedAt: 0, byUrl: new Map() };
+    }
 
-    const payload = {
+    const info = await reindex(max);
+    const store = getStore();
+
+    const sample = store.docs.slice(0, 3).map(({ title, url, price, image, cats }) => ({
+      title, url, price: price ?? null, image: image ?? null, cats: cats ?? []
+    }));
+
+    return new Response(JSON.stringify({
       ok: true,
       count: store.docs.length,
-      sample: store.docs.slice(0, 3).map(({ title, url, price }) => ({ title, url, price })),
-      sitemapCount,
-      taken: docs.length,
+      sample,
+      sitemapCount: info.sitemapCount,
+      taken: info.taken,
       updatedAt: store.updatedAt
-    };
-    if (full) payload.docs = store.docs;
-
-    return res.status(200).json(payload);
-  } catch (err) {
-    console.error("reindex.js error:", err);
-    return res.status(200).json({
-      ok: false,
-      error: "REINDEX_ERROR",
-      message: String(err?.message || err)
+    }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "access-control-allow-origin": "*"
+      }
+    });
+  } catch (e) {
+    return new Response(JSON.stringify({ ok: false, error: String(e?.message || e) }), {
+      status: 500,
+      headers: {
+        "content-type": "application/json; charset=utf-8",
+        "access-control-allow-origin": "*"
+      }
     });
   }
 }
