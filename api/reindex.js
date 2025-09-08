@@ -1,147 +1,126 @@
 // /api/reindex.js
-// Reindexa productos de Electrominds desde los sitemaps y deja un índice en memoria.
-// Más defensivo: parsing de URL seguro, fallbacks de sitemap y timeouts controlados.
+export const config = { runtime: "edge" };
 
 const ORIGIN = "https://www.electrominds.com.co";
 const SITEMAP_INDEX = `${ORIGIN}/sitemap.xml`;
-const FALLBACK_SITEMAPS = [
-  `${ORIGIN}/store-products-sitemap.xml`,
-  `${ORIGIN}/pages-sitemap.xml`,
-];
 
-const UA = "ElectromindsCrawler/1.1 (+https://electrominds.com.co)";
+// cache global en memoria del runtime
+globalThis.__ELECTRO_IDX ||= { docs: [], updatedAt: 0 };
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function okJson(res, data, status = 200) {
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.status(status).send(JSON.stringify(data));
-}
-
-function norm(s = "") {
-  return String(s).normalize("NFKC").replace(/\s+/g, " ").trim();
-}
-
-async function fetchText(url, { timeout = 15000 } = {}) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeout);
-  try {
-    const rsp = await fetch(url, { headers: { "User-Agent": UA }, signal: ctrl.signal });
-    if (!rsp.ok) throw new Error(`HTTP ${rsp.status} ${url}`);
-    return await rsp.text();
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-function parseXmlLocs(xml) {
+function pickAll(text, re) {
   const out = [];
-  const rx = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
-  let m;
-  while ((m = rx.exec(xml))) out.push(m[1]);
+  for (const m of text.matchAll(re)) out.push(m[1]);
   return out;
 }
 
-function pick(html, name, attr = "content") {
-  const rx = new RegExp(
-    `<meta[^>]+(?:property|name)=[\\"']${name}[\\"'][^>]*${attr}=[\\"']([^\\"]+)[\\"'][^>]*>`,
-    "i"
+async function fetchText(url) {
+  const r = await fetch(url, { headers:{ "user-agent":"Mozilla/5.0 (chat-crawler)" }});
+  if (!r.ok) throw new Error(`fetch ${url} -> ${r.status}`);
+  return await r.text();
+}
+
+function normalizeTitle(t) {
+  return (t||"")
+    .replace(/\s*\|\s*Electrominds\s*$/i,"")
+    .replace(/\s+/g," ")
+    .trim();
+}
+
+async function listProductUrls() {
+  const xml = await fetchText(SITEMAP_INDEX);
+  const locs = pickAll(xml, /<loc>(.*?)<\/loc>/g);
+  const wanted = locs.filter(u =>
+    /store-products-sitemap\.xml|pages-sitemap\.xml|product-.*-sitemap\.xml/i.test(u)
   );
-  const m = html.match(rx);
-  return m ? m[1] : "";
-}
 
-function pickTitle(html) {
-  const m = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-  return m ? m[1] : "";
-}
-
-function isProduct(u) {
-  return /\/product-page\//i.test(u);
-}
-
-async function safePageToDoc(url) {
-  try {
-    const html = await fetchText(url, { timeout: 15000 });
-    const title = norm(pick("","")) || norm(pickTitle(html)); // fallback
-    const ogt = norm(pick(html, "og:title")) || norm(pickTitle(html));
-    const finalTitle = ogt || title;
-    if (!finalTitle) return null;
-
-    const image = pick(html, "og:image") || pick(html, "twitter:image") || null;
-    return { title: finalTitle, url, image, price: null, cats: [] };
-  } catch {
-    return null; // saltamos errores de página
-  }
-}
-
-async function getSitemaps() {
-  try {
-    const xml = await fetchText(SITEMAP_INDEX, { timeout: 12000 });
-    const locs = parseXmlLocs(xml);
-    // prioriza productos
-    return [
-      ...locs.filter((l) => /store-products-sitemap/i.test(l)),
-      ...locs.filter((l) => !/store-products-sitemap/i.test(l)),
-    ];
-  } catch {
-    return FALLBACK_SITEMAPS;
-  }
-}
-
-async function buildIndex({ max = 120 } = {}) {
-  const started = Date.now();
-  const sitemaps = await getSitemaps();
-
-  const urls = [];
-  for (const sm of sitemaps) {
+  const urls = new Set();
+  for (const sm of wanted) {
     try {
-      const xml = await fetchText(sm, { timeout: 12000 });
-      const locs = parseXmlLocs(xml).filter(isProduct);
-      for (const u of locs) {
-        urls.push(u);
-        if (urls.length >= max) break;
-      }
-      if (urls.length >= max) break;
-    } catch {
-      // ignoramos ese sitemap
-    }
+      const x = await fetchText(sm);
+      pickAll(x, /<loc>(.*?)<\/loc>/g)
+        .filter(u => /\/product-page\//i.test(u))
+        .forEach(u => urls.add(u));
+    } catch {}
   }
-
-  const docs = [];
-  let i = 0;
-  const CONC = Math.min(4, urls.length); // más conservador para evitar 500/timeout
-
-  async function worker() {
-    while (i < urls.length) {
-      const idx = i++;
-      const d = await safePageToDoc(urls[idx]);
-      if (d) docs.push(d);
-      await sleep(10);
-    }
-  }
-  await Promise.all(Array.from({ length: CONC }, worker));
-
-  globalThis.__INDEX = { ts: Date.now(), docs, version: 4 };
-  return { docs, taken: Date.now() - started };
+  return [...urls];
 }
 
-export default async function handler(req, res) {
-  try {
-    const u = new URL(req.url || "", "http://localhost"); // base segura
-    const max = Math.max(1, Math.min(300, Number(u.searchParams.get("max")) || 120));
+function parseMeta(html, prop) {
+  const re = new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["']`, "i");
+  const m = html.match(re);
+  return m ? m[1] : "";
+}
 
-    const { docs, taken } = await buildIndex({ max });
-    okJson(res, {
-      ok: true,
-      count: docs.length,
-      sample: docs.slice(0, 3).map((d) => ({ title: d.title, url: d.url, image: d.image })),
-      taken,
-      updatedAt: Date.now(),
-    });
-  } catch (err) {
-    okJson(res, { ok: false, code: "REINDEX_FAILED", error: String(err?.message || err) }, 500);
+async function parseProduct(url, full) {
+  if (!full) {
+    // título aproximado a partir del slug
+    const slug = decodeURIComponent(url.split("/product-page/")[1] || url).replace(/[-_]+/g," ");
+    return { url, title: slug.trim(), price: null, image: "" };
   }
+  try {
+    const html = await fetchText(url);
+    const title = normalizeTitle(parseMeta(html, "og:title"));
+    const image = parseMeta(html, "og:image") || parseMeta(html, "twitter:image");
+    return { url, title: title || url, price: null, image };
+  } catch {
+    return { url, title: url, price: null, image: "" };
+  }
+}
+
+async function mapLimit(items, limit, fn) {
+  const out = [];
+  let i = 0, active = 0;
+  return await new Promise((resolve) => {
+    const go = async () => {
+      while (active < limit && i < items.length) {
+        const idx = i++, it = items[idx];
+        active++;
+        fn(it).then(v => out[idx] = v).catch(()=> out[idx]=null).finally(() => {
+          active--;
+          if (i >= items.length && active === 0) resolve(out);
+          else go();
+        });
+      }
+    };
+    go();
+  });
+}
+
+export default async function handler(req) {
+  const { searchParams } = new URL(req.url);
+  const max = Math.max(1, Math.min(600, Number(searchParams.get("max")) || 120));
+  const full = (searchParams.get("full") === "1" || searchParams.get("full") === "true");
+
+  let urls = [];
+  try {
+    urls = await listProductUrls();
+  } catch (e) {
+    return new Response(JSON.stringify({ ok:false, error:String(e) }), { status:500 });
+  }
+  urls = urls.slice(0, max);
+
+  // limitar concurrencia al pedir páginas completas
+  const CONC = full ? 5 : 10;
+  const started = Date.now();
+
+  const docs = (await mapLimit(urls, CONC, u => parseProduct(u, full)))
+    .filter(Boolean);
+
+  globalThis.__ELECTRO_IDX.docs = docs;
+  globalThis.__ELECTRO_IDX.updatedAt = Date.now();
+
+  const sample = docs.slice(0, 3).map(d => ({ title:d.title, url:d.url, price:d.price, image:d.image }));
+
+  return new Response(JSON.stringify({
+    ok: true,
+    count: docs.length,
+    sample,
+    sitemapCount: urls.length,
+    taken: Date.now() - started,
+    updatedAt: globalThis.__ELECTRO_IDX.updatedAt
+  }), { headers:{ "content-type":"application/json" }});
 }
 
 
