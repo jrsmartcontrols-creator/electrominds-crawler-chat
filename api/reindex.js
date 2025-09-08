@@ -1,41 +1,83 @@
-// Construye un índice rápido leyendo el sitemap de Electrominds
+// Reindexa Electrominds leyendo sitemap(s) y con fallback desde la home
 import axios from "axios";
 import { parseStringPromise } from "xml2js";
-import { load } from "cheerio";   // 👈 cambio clave: import { load } from "cheerio"
+import { load } from "cheerio";
 
-// Índice en memoria (se mantiene mientras la función esté “caliente”)
 let INDEX = globalThis.__EM_INDEX__ || { docs: [], updatedAt: 0 };
 globalThis.__EM_INDEX__ = INDEX;
 
-// URL del sitemap de tu Wix
-const SITEMAP_URL = "https://www.electrominds.com.co/sitemap.xml";
+const SITE = "https://www.electrominds.com.co";
+const SITEMAP_URL = `${SITE}/sitemap.xml`;
 
-// Filtramos URLs útiles (productos, colecciones, etc.)
+// Filtro de URLs "útiles" (ajústalo si quieres ser más o menos agresivo)
 const isUseful = (url = "") =>
-  /product-page|collections|tienda|shop|productos|product/i.test(url);
+  /product-page|product|collections|tienda|shop|productos/i.test(url);
 
-// Lee y parsea el sitemap
-async function fetchSitemapUrls() {
-  const { data } = await axios.get(SITEMAP_URL, {
+// ---------- Lectura de sitemaps ----------
+async function fetchXml(url) {
+  const { data } = await axios.get(url, {
     timeout: 20000,
-    headers: { "User-Agent": "Mozilla/5.0" },
+    headers: { "User-Agent": "Mozilla/5.0" }
   });
-  const xml = await parseStringPromise(data);
-  const urls = (xml.urlset?.url || [])
-    .map((u) => u?.loc?.[0])
-    .filter(Boolean);
-  return [...new Set(urls.filter(isUseful))];
+  return parseStringPromise(data);
 }
 
-// Extrae título, precio y texto de una página
+// Lee urlset (sitemap "plano")
+function extractFromUrlset(xml) {
+  const urls = (xml.urlset?.url || [])
+    .map(u => u?.loc?.[0])
+    .filter(Boolean);
+  return urls;
+}
+
+// Lee sitemapindex (lista de sitemaps)
+function extractFromIndex(xml) {
+  const sm = (xml.sitemapindex?.sitemap || [])
+    .map(s => s?.loc?.[0])
+    .filter(Boolean);
+  return sm;
+}
+
+async function fetchAllSitemapUrls() {
+  const root = await fetchXml(SITEMAP_URL);
+
+  // Caso 1: sitemap index -> recorrer sub-sitemaps
+  const submaps = extractFromIndex(root);
+  let urls = [];
+  if (submaps.length) {
+    for (const smUrl of submaps) {
+      try {
+        const sub = await fetchXml(smUrl);
+        urls.push(...extractFromUrlset(sub));
+      } catch {
+        // ignoramos errores de sitemaps individuales
+      }
+    }
+  } else {
+    // Caso 2: sitemap plano
+    urls = extractFromUrlset(root);
+  }
+
+  // Normalizamos, filtramos por dominio y por utilidad
+  const filtered = urls
+    .filter(Boolean)
+    .map(u => (u.startsWith("http") ? u : SITE + u))
+    .filter(u => u.includes("electrominds.com.co"))
+    .filter(isUseful);
+
+  // Únicos
+  return [...new Set(filtered)];
+}
+
+// ---------- Scraping de páginas ----------
 async function scrape(url) {
   try {
     const { data: html } = await axios.get(url, {
       timeout: 20000,
-      headers: { "User-Agent": "Mozilla/5.0" },
+      headers: { "User-Agent": "Mozilla/5.0" }
     });
 
-    const $ = load(html); // 👈 cambio aquí
+    const $ = load(html);
 
     const title =
       $('meta[property="og:title"]').attr("content") ||
@@ -43,7 +85,6 @@ async function scrape(url) {
       $("h1").first().text().trim() ||
       url;
 
-    // Selectores típicos de Wix para precio (puede variar)
     const price =
       $('[data-hook="formatted-price"]').first().text().trim() ||
       $('[itemprop="price"]').first().attr("content") ||
@@ -53,32 +94,62 @@ async function scrape(url) {
     const desc =
       $('meta[name="description"]').attr("content") ||
       $('meta[property="og:description"]').attr("content") ||
-      $("p")
-        .map((_, el) => $(el).text())
-        .get()
-        .join(" ");
+      $("p").map((_, el) => $(el).text()).get().join(" ");
 
-    const text = [title, price, desc].join(" ").replace(/\s+/g, " ").toLowerCase();
+    const text = [title, price, desc]
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .toLowerCase();
 
     return { url, title, price, text };
-  } catch (e) {
-    // Si una página falla, devolvemos null y seguimos con las demás
+  } catch {
     return null;
   }
 }
 
-// Endpoint: /api/reindex
+// ---------- Fallback si no hay sitemap útil ----------
+async function fallbackUrlsFromHome() {
+  try {
+    const { data: html } = await axios.get(SITE, {
+      timeout: 15000,
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
+    const $ = load(html);
+    const links = $("a[href]")
+      .map((_, a) => $(a).attr("href"))
+      .get()
+      .filter(Boolean)
+      .map(href => (href.startsWith("http") ? href : SITE + href))
+      .filter(u => u.includes("electrominds.com.co"))
+      .filter(isUseful);
+    return [...new Set(links)];
+  } catch {
+    return [];
+  }
+}
+
+// ---------- Handler ----------
 export default async function handler(req, res) {
   try {
-    const urls = await fetchSitemapUrls();
+    let urls = [];
+    try {
+      urls = await fetchAllSitemapUrls();
+    } catch {
+      urls = [];
+    }
 
-    // Limitar para que no se pase de tiempo (ajustable)
-    const LIMITED = urls.slice(0, 15);
+    if (!urls.length) {
+      // Intento de respaldo
+      urls = await fallbackUrlsFromHome();
+    }
 
-    const results = await Promise.allSettled(LIMITED.map((u) => scrape(u)));
+    // Limitar por tiempo de ejecución
+    const LIMITED = urls.slice(0, 30);
+
+    const results = await Promise.allSettled(LIMITED.map(u => scrape(u)));
     const docs = results
-      .filter((r) => r.status === "fulfilled" && r.value)
-      .map((r) => r.value);
+      .filter(r => r.status === "fulfilled" && r.value)
+      .map(r => r.value);
 
     INDEX.docs = docs;
     INDEX.updatedAt = Date.now();
@@ -87,18 +158,17 @@ export default async function handler(req, res) {
       ok: true,
       count: docs.length,
       sample: docs.slice(0, 3).map(({ title, price, url }) => ({ title, price, url })),
-      updatedAt: INDEX.updatedAt,
+      updatedAt: INDEX.updatedAt
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
 }
 
-// Helpers para /api/ask
+// ---------- Helpers para /api/ask ----------
 export function getIndex() {
   return INDEX;
 }
-
 function scoreDoc(qTokens, doc) {
   let score = 0;
   for (const t of qTokens) {
@@ -108,15 +178,14 @@ function scoreDoc(qTokens, doc) {
   }
   return score;
 }
-
 export function queryIndex(q) {
   const idx = getIndex();
   if (!idx.docs.length) return [];
   const qTokens = String(q).toLowerCase().split(/\s+/).filter(Boolean);
   return idx.docs
-    .map((d) => ({ ...d, _score: scoreDoc(qTokens, d) }))
+    .map(d => ({ ...d, _score: scoreDoc(qTokens, d) }))
     .sort((a, b) => b._score - a._score)
-    .filter((d) => d._score > 0)
+    .filter(d => d._score > 0)
     .slice(0, 3);
 }
 
