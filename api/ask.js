@@ -1,68 +1,102 @@
 // api/ask.js
-import { getIndex } from "./reindex.js";
+const STATE = globalThis.__EM_INDEX || (globalThis.__EM_INDEX = { docs: [], updatedAt: 0 });
 
-const WHATSAPP = "https://wa.me/573203440092?text=Hola%20Electrominds,%20necesito%20asesor%20🙂";
+const WHATS = "https://wa.me/573203440092?text=" +
+  encodeURIComponent("Hola Electrominds, necesito asesor 🙂");
 
-// Normaliza texto para buscar (minúsculas y sin tildes)
-function norm(s = "") {
-  return s
-    .toString()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/\p{Diacritic}/gu, "");
+function norm(s) {
+  return String(s || "").toLowerCase();
 }
 
-function scoreDoc(doc, qn) {
-  const t = norm(doc.title);
-  const txt = norm(doc.text || "");
-  let s = 0;
-  if (t.includes(qn)) s += 3;
-  if (txt.includes(qn)) s += 1;
-  return s;
+function guessQueryGroup(q) {
+  const s = norm(q);
+  if (s.includes("arduino")) return "arduino";
+  if (s.includes("raspberry")) return "raspberry";
+  if (s.includes("sensor")) return "sensor";
+  if (s.includes("interruptor")) return "interruptor wifi";
+  if (s.includes("vga")) return "cables vga";
+  if (s.includes("cable")) return "cables";
+  return null;
 }
 
 export default async function handler(req, res) {
-  const { q = "", limit = "12", page = "1" } = req.query;
+  try {
+    const q = String(req.query.q || "").trim();
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit) || 12));
+    const page = Math.max(1, Number(req.query.page) || 1);
 
-  const { docs, updatedAt } = getIndex();
-  const L = Math.max(1, Math.min(50, parseInt(limit, 10) || 12));
-  const P = Math.max(1, parseInt(page, 10) || 1);
+    if (!STATE.docs || STATE.docs.length === 0) {
+      return res.status(200).json({
+        ok: true,
+        found: false,
+        total: 0,
+        page,
+        pages: 1,
+        limit,
+        message: "Índice vacío. Abre /api/reindex primero para cargar el contenido.",
+        contact_url: WHATS,
+        results: [],
+      });
+    }
 
-  if (!docs || docs.length === 0) {
-    return res.status(200).json({
+    if (!q) {
+      // si no mandan consulta, devolvemos nada pero con whatsapp
+      return res.status(200).json({
+        ok: true,
+        found: false,
+        total: 0,
+        page,
+        pages: 1,
+        limit,
+        contact_url: WHATS,
+        results: [],
+      });
+    }
+
+    // Si la consulta menciona un grupo, filtramos por grupo.
+    const group = guessQueryGroup(q);
+
+    // Búsqueda por score sencillo (título + texto)
+    const words = norm(q).split(/\s+/).filter(Boolean);
+
+    const scored = STATE.docs
+      .filter(d => (group ? d.group === group : true))
+      .map(d => {
+        const haystack = norm(d.title + " " + d.text);
+        let score = 0;
+        for (const w of words) {
+          if (haystack.includes(w)) score += 1;
+        }
+        // bonus por coincidencia completa de frase
+        if (haystack.includes(norm(q))) score += 2;
+        return { ...d, _score: score };
+      })
+      .filter(d => d._score > 0)
+      .sort((a, b) => b._score - a._score);
+
+    const total = scored.length;
+    const pages = Math.max(1, Math.ceil(total / limit));
+    const slice = scored.slice((page - 1) * limit, page * limit);
+
+    const results = slice.map(d => ({
+      title: d.title,
+      url: d.url,
+      group: d.group,
+    }));
+
+    res.status(200).json({
       ok: true,
-      found: false,
-      total: 0,
-      page: P,
-      pages: 1,
-      limit: L,
-      message: "Índice vacío. Abre /api/reindex primero para cargar el contenido.",
-      contact_url: WHATSAPP,
-      results: [],
+      found: total > 0,
+      total,
+      page,
+      pages,
+      limit,
+      contact_url: WHATS,
+      results,
+      // si no encontró nada, devolvemos un mensajito útil
+      message: total === 0 ? "No encontré resultados para esa búsqueda." : undefined,
     });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err?.message || "ask_failed", contact_url: WHATS });
   }
-
-  const qn = norm(q);
-  const ranked = qn
-    ? docs
-        .map((d) => ({ ...d, _s: scoreDoc(d, qn) }))
-        .filter((d) => d._s > 0)
-        .sort((a, b) => b._s - a._s)
-    : docs.map((d) => ({ ...d, _s: 0 }));
-
-  const total = ranked.length;
-  const pages = Math.max(1, Math.ceil(total / L));
-  const slice = ranked.slice((P - 1) * L, (P - 1) * L + L);
-
-  return res.status(200).json({
-    ok: true,
-    found: total > 0,
-    total,
-    page: P,
-    pages,
-    limit: L,
-    contact_url: WHATSAPP,
-    results: slice.map(({ _s, ...r }) => r),
-    updatedAt,
-  });
 }
