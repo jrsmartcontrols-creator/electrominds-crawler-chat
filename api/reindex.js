@@ -1,125 +1,112 @@
-// api/reindex.js
-import { setTimeout as wait } from "node:timers/promises";
+// /api/reindex.js
+import axios from "axios";
+import { XMLParser } from "fast-xml-parser";
 
-const SITE = "https://www.electrominds.com.co";
-const ROOT_SITEMAP = `${SITE}/sitemap.xml`;
-
-// util: descarga con pequeño timeout
-async function fetchText(url, { timeoutMs = 12000 } = {}) {
-  const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { signal: ctrl.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
-    return await res.text();
-  } finally {
-    clearTimeout(to);
-  }
+// --- CORS helper ---
+function withCORS(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
-
-function decode(str = "") {
-  return str
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-}
-function pick(re, html) {
-  const m = html.match(re);
-  return m ? decode(m[1]).trim() : "";
-}
-
-// extrae metadatos básicos de una página Wix/Store
-function extractDoc(html, url) {
-  const title =
-    pick(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i, html) ||
-    pick(/<title>([^<]+)<\/title>/i, html);
-
-  const text =
-    pick(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i, html);
-
-  const image =
-    pick(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i, html);
-
-  const price =
-    pick(/"price"\s*:\s*"([^"]+)"/i, html) ||
-    pick(/itemprop=["']price["'][^>]+content=["']([^"']+)["']/i, html) ||
-    "";
-
-  return {
-    title: title || url,
-    text,
-    url,
-    price: price || null,
-    image: image || null,
-  };
-}
-
-async function scrapeMany(urls, { concurrency = 8 } = {}) {
-  const docs = [];
-  let i = 0;
-  async function worker() {
-    while (i < urls.length) {
-      const my = i++;
-      const u = urls[my];
-      try {
-        const html = await fetchText(u, { timeoutMs: 12000 });
-        const doc = extractDoc(html, u);
-        docs.push(doc);
-      } catch {
-        // ignora errores individuales
-      }
-      // micro-respiro para no abrumar
-      await wait(5);
-    }
-  }
-  await Promise.all(Array.from({ length: concurrency }, worker));
-  return docs;
-}
-
 export default async function handler(req, res) {
-  const url = new URL(req.url, `https://${req.headers.host}`);
-  const max = Math.max(1, Math.min(Number(url.searchParams.get("max")) || 120, 600));
-  const includeData = url.searchParams.has("data"); // /api/reindex?data=1
-  const t0 = Date.now();
+  withCORS(res);
+  if (req.method === "OPTIONS") return res.status(204).end();
 
-  // 1) lee el sitemap raíz y toma los sub-sitemaps
-  let xml;
   try {
-    xml = await fetchText(ROOT_SITEMAP, { timeoutMs: 12000 });
-  } catch (e) {
-    return res.status(502).json({ ok: false, error: "No pude leer el sitemap raíz", detail: String(e) });
-  }
-  const subMaps = [...xml.matchAll(/<loc>([^<]+\.xml)<\/loc>/g)]
-    .map(m => m[1])
-    .filter(href => href.startsWith(SITE));
+    const max = Math.min(parseInt(req.query.max || "120", 10), 500);
+    const takeImages = req.query.full === "1" || req.query.full === "true";
 
-  // 2) obtiene URLs de páginas desde cada sub-sitemap
-  const pageUrls = [];
-  for (const sm of subMaps) {
-    try {
-      const sx = await fetchText(sm, { timeoutMs: 12000 });
-      for (const m of sx.matchAll(/<loc>([^<]+)<\/loc>/g)) {
-        const u = m[1];
-        if (u.startsWith(SITE)) pageUrls.push(u);
+    // Guardamos el índice en memoria entre invocaciones
+    globalThis.__EM_INDEX__ ||= { docs: [], updatedAt: 0 };
+
+    // 1) Descarga del sitemap principal de Electrominds (Wix)
+    const SITEMAP_URL = "https://www.electrominds.com.co/sitemap.xml";
+    const xml = (await axios.get(SITEMAP_URL, { timeout: 20000 })).data;
+    const parser = new XMLParser({ ignoreAttributes: false });
+    const parsed = parser.parse(xml);
+
+    // Obtiene la lista de sitemaps secundarios
+    const sm = parsed?.sitemapindex?.sitemap || [];
+    const sitemapUrls = (Array.isArray(sm) ? sm : [sm])
+      .map((s) => s?.loc)
+      .filter(Boolean);
+
+    const urls = [];
+    // 2) Abre cada sitemap secundario y recoge las URLs de páginas
+    for (const smUrl of sitemapUrls) {
+      try {
+        const xml2 = (await axios.get(smUrl, { timeout: 20000 })).data;
+        const p2 = parser.parse(xml2);
+        const urlset = p2?.urlset?.url || [];
+        const items = (Array.isArray(urlset) ? urlset : [urlset])
+          .map((u) => u?.loc)
+          .filter(Boolean);
+        urls.push(...items);
+        if (urls.length >= max) break;
+      } catch {
+        // continúa con el siguiente sitemap
       }
-    } catch {
-      // continúa con los demás
     }
+
+    // 3) Baja cada página (limitado por "max") y extrae título, imagen y texto
+    const docs = [];
+    for (const url of urls.slice(0, max)) {
+      try {
+        const html = (await axios.get(url, { timeout: 20000 })).data;
+
+        // Título
+        const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+        const title = (titleMatch?.[1] || "Electrominds").trim();
+
+        // Imagen (og:image)
+        let image = "";
+        const ogImg =
+          html.match(
+            /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i
+          )?.[1] ||
+          html.match(/<img[^>]+src=["']([^"']+)["'][^>]*class=["'][^"']*product/i)
+            ?.[1] ||
+          "";
+
+        if (takeImages) image = ogImg || "";
+
+        // Texto plano (muy básico)
+        const text = html
+          .replace(/<script[\s\S]*?<\/script>/gi, " ")
+          .replace(/<style[\s\S]*?<\/style>/gi, " ")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .slice(0, 2000)
+          .trim();
+
+        docs.push({
+          title,
+          url,
+          image,
+          price: null,
+          text
+        });
+      } catch {
+        // continua
+      }
+    }
+
+    globalThis.__EM_INDEX__.docs = docs;
+    globalThis.__EM_INDEX__.updatedAt = Date.now();
+
+    return res.status(200).json({
+      ok: true,
+      count: docs.length,
+      sample: docs.slice(0, 3).map((d) => ({ title: d.title, url: d.url, image: d.image })),
+      sitemapCount: sitemapUrls.length,
+      taken: urls.length,
+      updatedAt: globalThis.__EM_INDEX__.updatedAt
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: "index_failed",
+      message: err?.message || "Index error"
+    });
   }
-
-  // 3) desduplica y recorta
-  const urls = [...new Set(pageUrls)].slice(0, max);
-
-  // 4) extrae metadatos (en paralelo controlado)
-  const docs = await scrapeMany(urls, { concurrency: 8 });
-
-  const payload = {
-    ok: true,
-    count: docs.length,
-    sitemapCount: subMaps.length,
-    taken: Date.now() - t0,
-    updatedAt: Date.now(),
-    sample: docs.slice(0, 3),
-  };
-  if (includeData) payload.docs = docs;
-  res.status(200).json(payload);
 }
