@@ -3,165 +3,114 @@ import axios from "axios";
 import { parseStringPromise } from "xml2js";
 import * as cheerio from "cheerio";
 
-// ===== Estado en memoria (se conserva en caliente) =====
-let DOCS = [];
-let UPDATED_AT = 0;
+/**
+ * Sitio base (Wix)
+ */
+const SITE = "https://www.electrominds.com.co";
+const SITEMAP_INDEX = `${SITE}/sitemap.xml`;
 
-// Exportado para que ask.js pueda leerlo
-export function getIndex() {
-  return { docs: DOCS, updatedAt: UPDATED_AT };
-}
+/**
+ * Memoria en caliente (dura mientras no haya cold start)
+ */
+const STATE = globalThis.__EM_INDEX || (globalThis.__EM_INDEX = { docs: [], updatedAt: 0 });
 
-// ===== Helpers =====
-const ORIGIN = "https://www.electrominds.com.co";
-const SITEMAP_INDEX_URL = `${ORIGIN}/sitemap.xml`;
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36";
+/**
+ * Extrae todas las URLs de los sitemaps de Wix
+ */
+async function getAllSitemapUrls() {
+  const { data } = await axios.get(SITEMAP_INDEX, { timeout: 20000 });
+  const xml = await parseStringPromise(data);
+  const sitemapList = xml.sitemapindex?.sitemap?.map(s => s.loc[0]) || [];
+  const urls = [];
 
-const http = axios.create({
-  timeout: 10000,
-  headers: { "User-Agent": UA, Accept: "*/*" },
-  // Wix a veces redirige; sigue redirecciones
-  maxRedirects: 5,
-});
-
-async function fetchXml(url) {
-  const { data } = await http.get(url);
-  return await parseStringPromise(data);
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// Corre tareas con concurrencia controlada (sin lib externa)
-async function runPool(items, worker, pool = 8) {
-  const out = [];
-  let i = 0;
-  async function next() {
-    while (i < items.length) {
-      const cur = i++;
-      try {
-        const v = await worker(items[cur], cur);
-        if (v) out.push(v);
-      } catch {
-        // ignora y sigue
-      }
-    }
+  for (const sm of sitemapList) {
+    try {
+      const { data: smxml } = await axios.get(sm, { timeout: 20000 });
+      const smp = await parseStringPromise(smxml);
+      const locs = smp.urlset?.url?.map(u => u.loc[0]) || [];
+      urls.push(...locs);
+    } catch {}
   }
-  const runners = Array.from({ length: Math.min(pool, items.length) }, next);
-  await Promise.all(runners);
-  return out;
+  // Solo páginas del dominio
+  return urls.filter(u => u.startsWith(SITE));
 }
 
-function pick(str) {
-  return (str || "").trim();
+/**
+ * Saca una etiqueta (grupo) simple a partir de la URL
+ */
+function inferGroupFromUrl(url) {
+  const slug = url.toLowerCase();
+  if (slug.includes("arduino")) return "arduino";
+  if (slug.includes("raspberry")) return "raspberry";
+  if (slug.includes("sensor")) return "sensor";
+  if (slug.includes("interruptor")) return "interruptor wifi";
+  if (slug.includes("vga")) return "cables vga";
+  if (slug.includes("cable")) return "cables";
+  return "otros";
 }
 
-async function scrapeProduct(url, wantFull) {
+/**
+ * Lee título + descripción meta (rápido) para evitar timeouts
+ */
+async function fetchMeta(url) {
   try {
-    const { data } = await http.get(url);
-    const $ = cheerio.load(data);
-
-    // Título
+    const { data: html } = await axios.get(url, { timeout: 20000 });
+    const $ = cheerio.load(html);
     const title =
-      pick($('meta[property="og:title"]').attr("content")) ||
-      pick($("h1").first().text()) ||
+      $('meta[property="og:title"]').attr("content") ||
+      $("title").text().trim() ||
+      $("h1").first().text().trim() ||
       url;
 
-    // Imagen principal
-    const image =
-      pick($('meta[property="og:image"]').attr("content")) ||
-      pick($("img").first().attr("src")) ||
+    const desc =
+      $('meta[property="og:description"]').attr("content") ||
+      $('meta[name="description"]').attr("content") ||
       "";
 
-    // Precio (si aparece en meta product)
-    const price =
-      pick($('meta[property="product:price:amount"]').attr("content")) || "";
-
-    let text = "";
-    if (wantFull) {
-      // Tomamos un poco de texto descriptivo (sin pasarnos)
-      text =
-        pick($('meta[name="description"]').attr("content")) ||
-        pick($("p").slice(0, 2).text()).slice(0, 500);
-    }
-
-    return { title, url, image, price, text };
-  } catch (err) {
-    // Falla sola esta página, seguimos con las demás
-    return null;
+    return { title: title.replace(/\s+/g, " "), text: desc.replace(/\s+/g, " ") };
+  } catch {
+    return { title: url, text: "" };
   }
 }
 
-async function collectProductUrls(max) {
-  // 1) sitemap index
-  const xml = await fetchXml(SITEMAP_INDEX_URL);
-  const sitemaps = (xml.sitemapindex?.sitemap || [])
-    .map((s) => s.loc?.[0])
-    .filter(Boolean);
-
-  // De todos los sitemaps, prioriza los de “store-products”
-  const wanted = sitemaps.filter((u) =>
-    /store-products-sitemap\.xml/i.test(u)
-  );
-  const all = wanted.length ? wanted : sitemaps;
-
-  let urls = [];
-  for (const sm of all) {
-    try {
-      const xm = await fetchXml(sm);
-      const set = xm.urlset?.url || [];
-      const locs = set.map((u) => u.loc?.[0]).filter(Boolean);
-      // Filtra productos (evita miembros/foros si vienen mezclados)
-      const prods = locs.filter((u) => /product-page\//i.test(u));
-      urls.push(...prods);
-      if (urls.length >= max) break;
-    } catch {
-      // continua
-    }
-  }
-
-  // dedupe + recorta a max
-  urls = Array.from(new Set(urls)).slice(0, max);
-  return urls;
-}
-
-// ===== Handler principal =====
+/**
+ * GET /api/reindex?max=120
+ * Reconstruye el índice en memoria (rápido: solo título/desc)
+ */
 export default async function handler(req, res) {
   try {
-    const { max = "120", full = "0" } = req.query;
-    const wantFull = full === "1";
-    const MAX = Math.max(1, Math.min(400, parseInt(max, 10) || 120));
+    const max = Math.max(1, Math.min(1000, Number(req.query.max) || 120));
 
-    const urls = await collectProductUrls(MAX);
+    const allUrls = await getAllSitemapUrls();
+    const productUrls = allUrls
+      .filter(u => u.includes("/product-page/") || u.includes("/producto"))
+      .slice(0, max);
 
-    // Concurrencia moderada: 6 con full=1, 10 con full=0
-    const pool = wantFull ? 6 : 10;
+    const start = Date.now();
+    const docs = [];
 
-    const results = await runPool(
-      urls,
-      async (u) => await scrapeProduct(u, wantFull),
-      pool
-    );
+    for (const url of productUrls) {
+      const meta = await fetchMeta(url);
+      docs.push({
+        title: meta.title,
+        url,
+        text: meta.text,
+        group: inferGroupFromUrl(url),
+      });
+    }
 
-    // Limpia nulos
-    const docs = results.filter(Boolean);
+    STATE.docs = docs;
+    STATE.updatedAt = Date.now();
 
-    DOCS = docs;
-    UPDATED_AT = Date.now();
-
-    return res.status(200).json({
+    res.status(200).json({
       ok: true,
-      count: DOCS.length,
-      sample: DOCS.slice(0, 3),
-      taken: urls.length,
-      updatedAt: UPDATED_AT,
+      count: docs.length,
+      sitemapCount: allUrls.length,
+      taken: Date.now() - start,
+      updatedAt: STATE.updatedAt,
+      sample: docs.slice(0, 3).map(d => ({ title: d.title, url: d.url, group: d.group })),
     });
   } catch (err) {
-    return res
-      .status(500)
-      .json({ ok: false, error: "INDEX_FAILED", message: String(err) });
+    res.status(500).json({ ok: false, error: err?.message || "reindex_failed" });
   }
 }
-
