@@ -1,123 +1,117 @@
 // /api/ask.js
-const HUMAN_WHATSAPP =
-  "https://wa.me/573203440092?text=Hola%20Electrominds,%20necesito%20asesor%20🙂";
+// Responde con resultados {title, url}, filtrando por grupo si la consulta
+// contiene "arduino", "sensor", "interruptor wifi", "raspberry", "cables".
+// Si no hay índice, lo reconstruye automáticamente.
 
-const CACHE_KEY = "__EM_INDEX__";
+export const config = { runtime: "nodejs" };
 
-function words(s) {
-  return String(s || "")
-    .toLowerCase()
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .split(/[^a-z0-9]+/).filter(Boolean);
+const WA_NUMBER = "573203440092";
+
+function cors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-function scoreDoc(doc, qWords) {
-  const hay = (doc.title + " " + (doc.text || "")).toLowerCase();
-  let s = 0;
-  for (const w of qWords) {
-    // +3 si aparece en título, +1 si aparece en descripción, pequeño bonus de longitud
-    if (doc.title.toLowerCase().includes(w)) s += 3;
-    if (hay.includes(w)) s += 1;
-  }
-  return s + Math.min(2, doc.title.length / 100);
-}
-
-function detectGroupFromQuery(q) {
-  const s = q.toLowerCase();
+function wantGroup(q) {
+  const s = String(q || "").toLowerCase();
   if (s.includes("arduino")) return "arduino";
   if (s.includes("raspberry")) return "raspberry";
   if (s.includes("sensor")) return "sensor";
-  if (s.includes("interruptor") || s.includes("sonoff") || s.includes("wifi")) return "interruptor wifi";
-  if (s.includes("vga") || s.includes("cable")) return "cables vga";
-  return null; // sin grupo => buscar en todo
+  if (s.includes("interruptor") || s.includes("wifi")) return "interruptor wifi";
+  if (s.includes("cable") || s.includes("vga") || s.includes("rj45") || s.includes("cat")) return "cables";
+  return null;
 }
 
-async function ensureIndexReady() {
-  if (!globalThis[CACHE_KEY] || !globalThis[CACHE_KEY].docs?.length) {
-    // si no hay índice cargado, pedimos a /api/reindex que lo genere con un tamaño razonable
-    try {
-      const host = process.env.VERCEL_URL
-        ? `https://${process.env.VERCEL_URL}`
-        : "http://localhost:3000";
-      // generamos un índice fresquito (120 items por defecto)
-      await fetch(`${host}/api/reindex?max=120`, { headers: { "user-agent": "Mozilla/5.0" } });
-    } catch (e) {
-      // si falla, no detenemos; devolveremos mensaje de contacto humano
-      console.error("warmup failed:", e);
-    }
+function tokenize(s) {
+  return String(s || "")
+    .toLowerCase()
+    .normalize("NFD").replace(/\p{Diacritic}/gu, "")
+    .split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+function scoreDoc(doc, tokens) {
+  const hay = (doc.title + " " + doc.url).toLowerCase();
+  let score = 0;
+  for (const t of tokens) {
+    if (!t) continue;
+    if (hay.includes(t)) score += 2;
   }
-  return globalThis[CACHE_KEY] || { docs: [] };
+  // un pequeño plus si el token aparece completo en el título
+  for (const t of tokens) {
+    if (new RegExp(`\\b${t}\\b`, "i").test(doc.title)) score += 3;
+  }
+  return score;
+}
+
+// import lazy del builder de /api/reindex para reusar la misma lógica
+async function ensureIndex() {
+  const idx = globalThis.__electrominds_index;
+  const freshEnough = idx && idx.docs && idx.docs.length > 0 && Date.now() - idx.updatedAt < 1000 * 60 * 60 * 6; // 6h
+  if (freshEnough) return idx;
+
+  // reconstruye un índice chico para no pasarse del timeout
+  try {
+    const mod = await import("./reindex.js");
+    if (typeof mod.default === "function") {
+      // simula llamada interna
+      await mod.default(
+        { method: "GET", url: "/api/reindex?max=120" },
+        { setHeader(){}, status(){return { json(){} }}, json(){} } // dummy res (no usado)
+      );
+    }
+  } catch (_) {
+    // si falla el import, seguimos; tal vez otro lambda ya indexó
+  }
+  return globalThis.__electrominds_index || { docs: [], updatedAt: 0 };
 }
 
 export default async function handler(req, res) {
-  try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const q = (url.searchParams.get("q") || "").trim();
-    const limit = Math.max(1, Math.min(50, Number(url.searchParams.get("limit")) || 12));
-    const page = Math.max(1, Number(url.searchParams.get("page")) || 1);
+  cors(res);
+  if (req.method === "OPTIONS") return res.status(200).end();
 
-    // Si no hay query, devolvemos vacío + CTA humano
-    if (!q) {
-      return res.status(200).json({
-        ok: true,
-        found: false,
-        total: 0,
-        page, pages: 1, limit,
-        contact_url: HUMAN_WHATSAPP,
-        results: [],
-        message: "Escribe qué producto buscas (ej. arduino, sensor, interruptor wifi).",
-      });
-    }
+  const url = new URL(req.url, "http://localhost");
+  const q = url.searchParams.get("q") || "";
+  const page = Math.max(1, Number(url.searchParams.get("page") || 1));
+  const limit = Math.max(1, Math.min(24, Number(url.searchParams.get("limit") || 12)));
 
-    // nos aseguramos de tener índice en memoria
-    const idx = await ensureIndexReady();
-    const docs = idx.docs || [];
+  const idx = await ensureIndex();
+  const docs = idx.docs || [];
 
-    if (!docs.length) {
-      return res.status(200).json({
-        ok: true,
-        found: false,
-        total: 0,
-        page, pages: 1, limit,
-        message: "Índice vacío. Abre /api/reindex primero para cargar el contenido.",
-        contact_url: HUMAN_WHATSAPP,
-        results: [],
-      });
-    }
+  const contact_url = `https://wa.me/${WA_NUMBER}?text=` +
+    encodeURIComponent(`Hola Electrominds, necesito asesor 😊`);
 
-    // búsqueda simple con score
-    const qWords = words(q);
-    const group = detectGroupFromQuery(q);
-    const pool = group ? docs.filter(d => d.group === group) : docs;
-
-    const ranked = pool
-      .map(d => ({ ...d, _s: scoreDoc(d, qWords) }))
-      .filter(d => d._s > 0) // algo de coincidencia
-      .sort((a, b) => b._s - a._s);
-
-    const total = ranked.length;
-    const pages = Math.max(1, Math.ceil(total / limit));
-    const slice = ranked.slice((page - 1) * limit, (page - 1) * limit + limit);
-
-    const results = slice.map(d => ({
-      title: d.title,
-      url: d.url,
-      // la UI del chat usará estos campos para renderizar
-      buttons: [
-        { label: "Ver producto", href: d.url },
-        { label: "Asesor humano", href: HUMAN_WHATSAPP }
-      ]
-    }));
-
-    res.status(200).json({
-      ok: true,
-      found: total > 0,
-      total, page, pages, limit,
-      contact_url: HUMAN_WHATSAPP,
-      results,
+  if (!docs.length) {
+    return res.status(200).json({
+      ok: true, found: false, total: 0, page, pages: 1, limit,
+      message: "Índice vacío. Abre /api/reindex primero para cargar el contenido.",
+      contact_url, results: []
     });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: "ask_failed", contact_url: HUMAN_WHATSAPP });
   }
+
+  const tokens = tokenize(q);
+  const grp = wantGroup(q);
+
+  // filtra por grupo si aplica
+  let pool = grp ? docs.filter(d => d.group === grp) : docs.slice();
+
+  // ranking
+  const ranked = pool
+    .map(d => ({ d, s: scoreDoc(d, tokens) }))
+    .filter(x => tokens.length === 0 ? true : x.s > 0)
+    .sort((a, b) => b.s - a.s)
+    .map(x => x.d);
+
+  const total = ranked.length;
+  const pages = Math.max(1, Math.ceil(total / limit));
+  const start = (page - 1) * limit;
+  const pageItems = ranked.slice(start, start + limit);
+
+  return res.status(200).json({
+    ok: true,
+    found: total > 0,
+    total, page, pages, limit,
+    contact_url,
+    results: pageItems.map(({ title, url }) => ({ title, url }))
+  });
 }
