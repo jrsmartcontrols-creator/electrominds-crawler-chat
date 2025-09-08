@@ -1,112 +1,167 @@
-// /api/reindex.js
+// api/reindex.js
 import axios from "axios";
-import { XMLParser } from "fast-xml-parser";
+import { parseStringPromise } from "xml2js";
+import * as cheerio from "cheerio";
 
-// --- CORS helper ---
-function withCORS(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+// ===== Estado en memoria (se conserva en caliente) =====
+let DOCS = [];
+let UPDATED_AT = 0;
+
+// Exportado para que ask.js pueda leerlo
+export function getIndex() {
+  return { docs: DOCS, updatedAt: UPDATED_AT };
 }
-export default async function handler(req, res) {
-  withCORS(res);
-  if (req.method === "OPTIONS") return res.status(204).end();
 
+// ===== Helpers =====
+const ORIGIN = "https://www.electrominds.com.co";
+const SITEMAP_INDEX_URL = `${ORIGIN}/sitemap.xml`;
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36";
+
+const http = axios.create({
+  timeout: 10000,
+  headers: { "User-Agent": UA, Accept: "*/*" },
+  // Wix a veces redirige; sigue redirecciones
+  maxRedirects: 5,
+});
+
+async function fetchXml(url) {
+  const { data } = await http.get(url);
+  return await parseStringPromise(data);
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Corre tareas con concurrencia controlada (sin lib externa)
+async function runPool(items, worker, pool = 8) {
+  const out = [];
+  let i = 0;
+  async function next() {
+    while (i < items.length) {
+      const cur = i++;
+      try {
+        const v = await worker(items[cur], cur);
+        if (v) out.push(v);
+      } catch {
+        // ignora y sigue
+      }
+    }
+  }
+  const runners = Array.from({ length: Math.min(pool, items.length) }, next);
+  await Promise.all(runners);
+  return out;
+}
+
+function pick(str) {
+  return (str || "").trim();
+}
+
+async function scrapeProduct(url, wantFull) {
   try {
-    const max = Math.min(parseInt(req.query.max || "120", 10), 500);
-    const takeImages = req.query.full === "1" || req.query.full === "true";
+    const { data } = await http.get(url);
+    const $ = cheerio.load(data);
 
-    // Guardamos el índice en memoria entre invocaciones
-    globalThis.__EM_INDEX__ ||= { docs: [], updatedAt: 0 };
+    // Título
+    const title =
+      pick($('meta[property="og:title"]').attr("content")) ||
+      pick($("h1").first().text()) ||
+      url;
 
-    // 1) Descarga del sitemap principal de Electrominds (Wix)
-    const SITEMAP_URL = "https://www.electrominds.com.co/sitemap.xml";
-    const xml = (await axios.get(SITEMAP_URL, { timeout: 20000 })).data;
-    const parser = new XMLParser({ ignoreAttributes: false });
-    const parsed = parser.parse(xml);
+    // Imagen principal
+    const image =
+      pick($('meta[property="og:image"]').attr("content")) ||
+      pick($("img").first().attr("src")) ||
+      "";
 
-    // Obtiene la lista de sitemaps secundarios
-    const sm = parsed?.sitemapindex?.sitemap || [];
-    const sitemapUrls = (Array.isArray(sm) ? sm : [sm])
-      .map((s) => s?.loc)
-      .filter(Boolean);
+    // Precio (si aparece en meta product)
+    const price =
+      pick($('meta[property="product:price:amount"]').attr("content")) || "";
 
-    const urls = [];
-    // 2) Abre cada sitemap secundario y recoge las URLs de páginas
-    for (const smUrl of sitemapUrls) {
-      try {
-        const xml2 = (await axios.get(smUrl, { timeout: 20000 })).data;
-        const p2 = parser.parse(xml2);
-        const urlset = p2?.urlset?.url || [];
-        const items = (Array.isArray(urlset) ? urlset : [urlset])
-          .map((u) => u?.loc)
-          .filter(Boolean);
-        urls.push(...items);
-        if (urls.length >= max) break;
-      } catch {
-        // continúa con el siguiente sitemap
-      }
+    let text = "";
+    if (wantFull) {
+      // Tomamos un poco de texto descriptivo (sin pasarnos)
+      text =
+        pick($('meta[name="description"]').attr("content")) ||
+        pick($("p").slice(0, 2).text()).slice(0, 500);
     }
 
-    // 3) Baja cada página (limitado por "max") y extrae título, imagen y texto
-    const docs = [];
-    for (const url of urls.slice(0, max)) {
-      try {
-        const html = (await axios.get(url, { timeout: 20000 })).data;
+    return { title, url, image, price, text };
+  } catch (err) {
+    // Falla sola esta página, seguimos con las demás
+    return null;
+  }
+}
 
-        // Título
-        const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-        const title = (titleMatch?.[1] || "Electrominds").trim();
+async function collectProductUrls(max) {
+  // 1) sitemap index
+  const xml = await fetchXml(SITEMAP_INDEX_URL);
+  const sitemaps = (xml.sitemapindex?.sitemap || [])
+    .map((s) => s.loc?.[0])
+    .filter(Boolean);
 
-        // Imagen (og:image)
-        let image = "";
-        const ogImg =
-          html.match(
-            /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i
-          )?.[1] ||
-          html.match(/<img[^>]+src=["']([^"']+)["'][^>]*class=["'][^"']*product/i)
-            ?.[1] ||
-          "";
+  // De todos los sitemaps, prioriza los de “store-products”
+  const wanted = sitemaps.filter((u) =>
+    /store-products-sitemap\.xml/i.test(u)
+  );
+  const all = wanted.length ? wanted : sitemaps;
 
-        if (takeImages) image = ogImg || "";
-
-        // Texto plano (muy básico)
-        const text = html
-          .replace(/<script[\s\S]*?<\/script>/gi, " ")
-          .replace(/<style[\s\S]*?<\/style>/gi, " ")
-          .replace(/<[^>]+>/g, " ")
-          .replace(/\s+/g, " ")
-          .slice(0, 2000)
-          .trim();
-
-        docs.push({
-          title,
-          url,
-          image,
-          price: null,
-          text
-        });
-      } catch {
-        // continua
-      }
+  let urls = [];
+  for (const sm of all) {
+    try {
+      const xm = await fetchXml(sm);
+      const set = xm.urlset?.url || [];
+      const locs = set.map((u) => u.loc?.[0]).filter(Boolean);
+      // Filtra productos (evita miembros/foros si vienen mezclados)
+      const prods = locs.filter((u) => /product-page\//i.test(u));
+      urls.push(...prods);
+      if (urls.length >= max) break;
+    } catch {
+      // continua
     }
+  }
 
-    globalThis.__EM_INDEX__.docs = docs;
-    globalThis.__EM_INDEX__.updatedAt = Date.now();
+  // dedupe + recorta a max
+  urls = Array.from(new Set(urls)).slice(0, max);
+  return urls;
+}
+
+// ===== Handler principal =====
+export default async function handler(req, res) {
+  try {
+    const { max = "120", full = "0" } = req.query;
+    const wantFull = full === "1";
+    const MAX = Math.max(1, Math.min(400, parseInt(max, 10) || 120));
+
+    const urls = await collectProductUrls(MAX);
+
+    // Concurrencia moderada: 6 con full=1, 10 con full=0
+    const pool = wantFull ? 6 : 10;
+
+    const results = await runPool(
+      urls,
+      async (u) => await scrapeProduct(u, wantFull),
+      pool
+    );
+
+    // Limpia nulos
+    const docs = results.filter(Boolean);
+
+    DOCS = docs;
+    UPDATED_AT = Date.now();
 
     return res.status(200).json({
       ok: true,
-      count: docs.length,
-      sample: docs.slice(0, 3).map((d) => ({ title: d.title, url: d.url, image: d.image })),
-      sitemapCount: sitemapUrls.length,
+      count: DOCS.length,
+      sample: DOCS.slice(0, 3),
       taken: urls.length,
-      updatedAt: globalThis.__EM_INDEX__.updatedAt
+      updatedAt: UPDATED_AT,
     });
   } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: "index_failed",
-      message: err?.message || "Index error"
-    });
+    return res
+      .status(500)
+      .json({ ok: false, error: "INDEX_FAILED", message: String(err) });
   }
 }
+
