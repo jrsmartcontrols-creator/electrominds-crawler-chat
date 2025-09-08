@@ -1,11 +1,15 @@
 // /api/reindex.js
-// Reindexa páginas públicas de Electrominds y deja un índice compacto en memoria
-// Seguro con caracteres raros, timeouts y sitemap por partes.
+// Reindexa productos de Electrominds desde los sitemaps y deja un índice en memoria.
+// Más defensivo: parsing de URL seguro, fallbacks de sitemap y timeouts controlados.
 
 const ORIGIN = "https://www.electrominds.com.co";
 const SITEMAP_INDEX = `${ORIGIN}/sitemap.xml`;
-const USER_AGENT =
-  "ElectromindsCrawler/1.0 (+https://electrominds.com.co) simple-bot";
+const FALLBACK_SITEMAPS = [
+  `${ORIGIN}/store-products-sitemap.xml`,
+  `${ORIGIN}/pages-sitemap.xml`,
+];
+
+const UA = "ElectromindsCrawler/1.1 (+https://electrominds.com.co)";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -14,21 +18,15 @@ function okJson(res, data, status = 200) {
   res.status(status).send(JSON.stringify(data));
 }
 
-function normTxt(s = "") {
-  return String(s)
-    .normalize("NFKC")
-    .replace(/\s+/g, " ")
-    .trim();
+function norm(s = "") {
+  return String(s).normalize("NFKC").replace(/\s+/g, " ").trim();
 }
 
-async function fetchText(url, { timeout = 12000 } = {}) {
+async function fetchText(url, { timeout = 15000 } = {}) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeout);
   try {
-    const rsp = await fetch(url, {
-      headers: { "User-Agent": USER_AGENT },
-      signal: ctrl.signal,
-    });
+    const rsp = await fetch(url, { headers: { "User-Agent": UA }, signal: ctrl.signal });
     if (!rsp.ok) throw new Error(`HTTP ${rsp.status} ${url}`);
     return await rsp.text();
   } finally {
@@ -36,7 +34,15 @@ async function fetchText(url, { timeout = 12000 } = {}) {
   }
 }
 
-function pickMeta(html, name, attr = "content") {
+function parseXmlLocs(xml) {
+  const out = [];
+  const rx = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
+  let m;
+  while ((m = rx.exec(xml))) out.push(m[1]);
+  return out;
+}
+
+function pick(html, name, attr = "content") {
   const rx = new RegExp(
     `<meta[^>]+(?:property|name)=[\\"']${name}[\\"'][^>]*${attr}=[\\"']([^\\"]+)[\\"'][^>]*>`,
     "i"
@@ -50,78 +56,92 @@ function pickTitle(html) {
   return m ? m[1] : "";
 }
 
-function parseXmlLocs(xml) {
-  const locs = [];
-  const rx = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
-  let m;
-  while ((m = rx.exec(xml))) locs.push(m[1]);
-  return locs;
+function isProduct(u) {
+  return /\/product-page\//i.test(u);
 }
 
-function onlyProductPages(url) {
-  // ajusta si quieres incluir más tipos
-  return /\/product-page\//i.test(url);
-}
-
-async function safePageToDoc(url, wantText) {
+async function safePageToDoc(url) {
   try {
-    const html = await fetchText(url);
-    const title =
-      normTxt(pickMeta(html, "og:title")) || normTxt(pickTitle(html));
-    const image = pickMeta(html, "og:image") || pickMeta(html, "twitter:image");
-    const cats = []; // si luego quieres extraer categorías, aquí
-    const price = null; // si hay marcado de precio, se podría extraer más tarde
-    const text = wantText
-      ? normTxt(
-          (html.match(/<p[^>]*>(.*?)<\/p>/gis) || [])
-            .map((x) => x.replace(/<[^>]*>/g, " "))
-            .join(" ")
-        )
-      : undefined;
+    const html = await fetchText(url, { timeout: 15000 });
+    const title = norm(pick("","")) || norm(pickTitle(html)); // fallback
+    const ogt = norm(pick(html, "og:title")) || norm(pickTitle(html));
+    const finalTitle = ogt || title;
+    if (!finalTitle) return null;
 
-    return { title, url, image, price, cats, ...(wantText ? { text } : {}) };
-  } catch (e) {
-    // ignoramos páginas que fallen
-    return null;
+    const image = pick(html, "og:image") || pick(html, "twitter:image") || null;
+    return { title: finalTitle, url, image, price: null, cats: [] };
+  } catch {
+    return null; // saltamos errores de página
   }
 }
 
-async function getAllSitemapUrls() {
-  // lee el índice y devuelve lista de sitemap hijos
-  const xml = await fetchText(SITEMAP_INDEX);
-  const locs = parseXmlLocs(xml);
-  // Prioriza el de productos si existe
-  const sorted = [
-    ...locs.filter((l) => /store-products-sitemap/i.test(l)),
-    ...locs.filter((l) => !/store-products-sitemap/i.test(l)),
-  ];
-  return sorted;
+async function getSitemaps() {
+  try {
+    const xml = await fetchText(SITEMAP_INDEX, { timeout: 12000 });
+    const locs = parseXmlLocs(xml);
+    // prioriza productos
+    return [
+      ...locs.filter((l) => /store-products-sitemap/i.test(l)),
+      ...locs.filter((l) => !/store-products-sitemap/i.test(l)),
+    ];
+  } catch {
+    return FALLBACK_SITEMAPS;
+  }
 }
 
-async function buildIndex({ max = 120, full = false } = {}) {
+async function buildIndex({ max = 120 } = {}) {
   const started = Date.now();
-  const sitemaps = await getAllSitemapUrls();
+  const sitemaps = await getSitemaps();
 
   const urls = [];
   for (const sm of sitemaps) {
     try {
-      const xml = await fetchText(sm);
-      const locs = parseXmlLocs(xml).filter(onlyProductPages);
+      const xml = await fetchText(sm, { timeout: 12000 });
+      const locs = parseXmlLocs(xml).filter(isProduct);
       for (const u of locs) {
         urls.push(u);
         if (urls.length >= max) break;
       }
       if (urls.length >= max) break;
     } catch {
-      // ignoramos sitemap caídos
+      // ignoramos ese sitemap
     }
   }
 
-  // pequeña cola para no saturar
-  const CONC = 6;
   const docs = [];
   let i = 0;
+  const CONC = Math.min(4, urls.length); // más conservador para evitar 500/timeout
 
   async function worker() {
     while (i < urls.length) {
+      const idx = i++;
+      const d = await safePageToDoc(urls[idx]);
+      if (d) docs.push(d);
+      await sleep(10);
+    }
+  }
+  await Promise.all(Array.from({ length: CONC }, worker));
+
+  globalThis.__INDEX = { ts: Date.now(), docs, version: 4 };
+  return { docs, taken: Date.now() - started };
+}
+
+export default async function handler(req, res) {
+  try {
+    const u = new URL(req.url || "", "http://localhost"); // base segura
+    const max = Math.max(1, Math.min(300, Number(u.searchParams.get("max")) || 120));
+
+    const { docs, taken } = await buildIndex({ max });
+    okJson(res, {
+      ok: true,
+      count: docs.length,
+      sample: docs.slice(0, 3).map((d) => ({ title: d.title, url: d.url, image: d.image })),
+      taken,
+      updatedAt: Date.now(),
+    });
+  } catch (err) {
+    okJson(res, { ok: false, code: "REINDEX_FAILED", error: String(err?.message || err) }, 500);
+  }
+}
+
 
