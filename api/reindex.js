@@ -1,140 +1,125 @@
 // api/reindex.js
-// Node 22 / Edge-friendly
-export const config = { runtime: "nodejs" };
+import { setTimeout as wait } from "node:timers/promises";
 
 const SITE = "https://www.electrominds.com.co";
 const ROOT_SITEMAP = `${SITE}/sitemap.xml`;
 
-// Guardamos en memoria para “calentamiento” de la misma instancia
-globalThis.__CATALOGO__ ??= { docs: [], updatedAt: 0 };
-
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-async function fetchText(url) {
-  const r = await fetch(url, { headers: { "user-agent": "ElectroMindsBot/1.0" } });
-  if (!r.ok) throw new Error(`HTTP ${r.status} en ${url}`);
-  return r.text();
-}
-
-function xmlLocs(xml) {
-  const locs = [];
-  const re = /<loc>([^<]+)<\/loc>/gim;
-  let m;
-  while ((m = re.exec(xml))) locs.push(m[1].trim());
-  return locs;
-}
-
-function ogMeta(html, prop) {
-  const re = new RegExp(
-    `<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["']`,
-    "i"
-  );
-  const m = html.match(re);
-  return m ? m[1] : "";
-}
-
-function normalize(s) {
-  return (s || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
-}
-
-async function getProductImage(url) {
+// util: descarga con pequeño timeout
+async function fetchText(url, { timeoutMs = 12000 } = {}) {
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const html = await fetchText(url);
-    // 1) OpenGraph image
-    const og = ogMeta(html, "og:image");
-    if (og) return og;
-    // 2) Wix images dentro del HTML (fallback simple)
-    const m = html.match(/https:\/\/static\.wixstatic\.com\/[^"']+\.(?:jpg|png|webp)/i);
-    return m ? m[0] : "";
-  } catch {
-    return "";
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
+    return await res.text();
+  } finally {
+    clearTimeout(to);
   }
+}
+
+function decode(str = "") {
+  return str
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+}
+function pick(re, html) {
+  const m = html.match(re);
+  return m ? decode(m[1]).trim() : "";
+}
+
+// extrae metadatos básicos de una página Wix/Store
+function extractDoc(html, url) {
+  const title =
+    pick(/<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i, html) ||
+    pick(/<title>([^<]+)<\/title>/i, html);
+
+  const text =
+    pick(/<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i, html);
+
+  const image =
+    pick(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i, html);
+
+  const price =
+    pick(/"price"\s*:\s*"([^"]+)"/i, html) ||
+    pick(/itemprop=["']price["'][^>]+content=["']([^"']+)["']/i, html) ||
+    "";
+
+  return {
+    title: title || url,
+    text,
+    url,
+    price: price || null,
+    image: image || null,
+  };
+}
+
+async function scrapeMany(urls, { concurrency = 8 } = {}) {
+  const docs = [];
+  let i = 0;
+  async function worker() {
+    while (i < urls.length) {
+      const my = i++;
+      const u = urls[my];
+      try {
+        const html = await fetchText(u, { timeoutMs: 12000 });
+        const doc = extractDoc(html, u);
+        docs.push(doc);
+      } catch {
+        // ignora errores individuales
+      }
+      // micro-respiro para no abrumar
+      await wait(5);
+    }
+  }
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  return docs;
 }
 
 export default async function handler(req, res) {
+  const url = new URL(req.url, `https://${req.headers.host}`);
+  const max = Math.max(1, Math.min(Number(url.searchParams.get("max")) || 120, 600));
+  const includeData = url.searchParams.has("data"); // /api/reindex?data=1
   const t0 = Date.now();
+
+  // 1) lee el sitemap raíz y toma los sub-sitemaps
+  let xml;
   try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    // Parámetros
-    const max = Math.max(1, Math.min(parseInt(url.searchParams.get("max") || "120", 10), 400));
-    const full = url.searchParams.get("full") === "1"; // Si 1, abrimos cada página para sacar imagen (más lento)
-
-    // 1) Tomamos todos los sitemaps del índice
-    const idxXml = await fetchText(ROOT_SITEMAP);
-    let sitemapUrls = xmlLocs(idxXml).filter(u => u.endsWith(".xml"));
-
-    // 2) De esos sitemaps, traemos las URLs de páginas. Filtramos las que lucen a producto.
-    const pageUrls = [];
-    for (const sm of sitemapUrls) {
-      const xml = await fetchText(sm);
-      const locs = xmlLocs(xml);
-      for (const loc of locs) {
-        if (
-          /\/product-page\//i.test(loc) ||
-          /\/store-products/i.test(loc) ||
-          /\/product\//i.test(loc)
-        ) {
-          pageUrls.push(loc);
-        }
-      }
-    }
-
-    // 3) Creamos documentos (limitando por max)
-    const docs = [];
-    const limited = pageUrls.slice(0, max);
-
-    // Para thumbnails sólo si piden full=1 (puede tardar). Fallback: sin imagen.
-    for (let i = 0; i < limited.length; i++) {
-      const url = limited[i];
-      // Un título rápido con la última parte de la URL, por si no hacemos "full"
-      const fallbackTitle = decodeURIComponent(url.split("/").filter(Boolean).pop() || "")
-        .replace(/[-_]/g, " ");
-
-      let image = "";
-      let title = fallbackTitle;
-      let price = null;
-
-      if (full) {
-        // Pedimos la página y sacamos meta og:title / og:image (y si hubiera, el precio)
-        const html = await fetchText(url);
-        title = ogMeta(html, "og:title") || fallbackTitle;
-        image = ogMeta(html, "og:image") || "";
-        const priceMeta = html.match(
-          /<meta[^>]+property=["']product:price:amount["'][^>]+content=["']([^"']+)["']/i
-        );
-        price = priceMeta ? priceMeta[1] : null;
-
-        // Pequeña pausa cada 10 para no saturar
-        if (i % 10 === 9) await sleep(150);
-      }
-
-      docs.push({
-        title: title.trim(),
-        url,
-        price,
-        image,
-        _norm: normalize(title)
-      });
-    }
-
-    // Guardamos en memoria de esta instancia (sirve mientras no cambie de lambda)
-    globalThis.__CATALOGO__ = { docs, updatedAt: Date.now() };
-
-    return res.status(200).json({
-      ok: true,
-      count: docs.length,
-      sample: docs.slice(0, 3).map(({ _norm, ...d }) => d),
-      sitemapCount: sitemapUrls.length,
-      taken: Date.now() - t0,
-      updatedAt: globalThis.__CATALOGO__.updatedAt
-    });
-  } catch (err) {
-    return res.status(500).json({
-      ok: false,
-      error: String(err),
-    });
+    xml = await fetchText(ROOT_SITEMAP, { timeoutMs: 12000 });
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: "No pude leer el sitemap raíz", detail: String(e) });
   }
+  const subMaps = [...xml.matchAll(/<loc>([^<]+\.xml)<\/loc>/g)]
+    .map(m => m[1])
+    .filter(href => href.startsWith(SITE));
+
+  // 2) obtiene URLs de páginas desde cada sub-sitemap
+  const pageUrls = [];
+  for (const sm of subMaps) {
+    try {
+      const sx = await fetchText(sm, { timeoutMs: 12000 });
+      for (const m of sx.matchAll(/<loc>([^<]+)<\/loc>/g)) {
+        const u = m[1];
+        if (u.startsWith(SITE)) pageUrls.push(u);
+      }
+    } catch {
+      // continúa con los demás
+    }
+  }
+
+  // 3) desduplica y recorta
+  const urls = [...new Set(pageUrls)].slice(0, max);
+
+  // 4) extrae metadatos (en paralelo controlado)
+  const docs = await scrapeMany(urls, { concurrency: 8 });
+
+  const payload = {
+    ok: true,
+    count: docs.length,
+    sitemapCount: subMaps.length,
+    taken: Date.now() - t0,
+    updatedAt: Date.now(),
+    sample: docs.slice(0, 3),
+  };
+  if (includeData) payload.docs = docs;
+  res.status(200).json(payload);
 }
