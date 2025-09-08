@@ -1,6 +1,6 @@
 import { getIndex, queryIndex } from "./reindex.js";
 
-const WHATSAPP = "https://wa.me/573001234567?text=Hola%20Electrominds,%20necesito%20asesor%C3%ADa";
+const WHATSAPP = "https://wa.me/573203440092?text=Hola%20Electrominds,%20necesito%20asesor%C3%ADa";
 
 export default async function handler(req, res) {
   const { q } = req.method === "POST" ? (req.body || {}) : (req.query || {});
