@@ -1,126 +1,140 @@
-// /api/reindex.js
-export const config = { runtime: "edge" };
+// api/reindex.js
+// Node 22 / Edge-friendly
+export const config = { runtime: "nodejs" };
 
-const ORIGIN = "https://www.electrominds.com.co";
-const SITEMAP_INDEX = `${ORIGIN}/sitemap.xml`;
+const SITE = "https://www.electrominds.com.co";
+const ROOT_SITEMAP = `${SITE}/sitemap.xml`;
 
-// cache global en memoria del runtime
-globalThis.__ELECTRO_IDX ||= { docs: [], updatedAt: 0 };
+// Guardamos en memoria para “calentamiento” de la misma instancia
+globalThis.__CATALOGO__ ??= { docs: [], updatedAt: 0 };
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-function pickAll(text, re) {
-  const out = [];
-  for (const m of text.matchAll(re)) out.push(m[1]);
-  return out;
-}
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 async function fetchText(url) {
-  const r = await fetch(url, { headers:{ "user-agent":"Mozilla/5.0 (chat-crawler)" }});
-  if (!r.ok) throw new Error(`fetch ${url} -> ${r.status}`);
-  return await r.text();
+  const r = await fetch(url, { headers: { "user-agent": "ElectroMindsBot/1.0" } });
+  if (!r.ok) throw new Error(`HTTP ${r.status} en ${url}`);
+  return r.text();
 }
 
-function normalizeTitle(t) {
-  return (t||"")
-    .replace(/\s*\|\s*Electrominds\s*$/i,"")
-    .replace(/\s+/g," ")
-    .trim();
+function xmlLocs(xml) {
+  const locs = [];
+  const re = /<loc>([^<]+)<\/loc>/gim;
+  let m;
+  while ((m = re.exec(xml))) locs.push(m[1].trim());
+  return locs;
 }
 
-async function listProductUrls() {
-  const xml = await fetchText(SITEMAP_INDEX);
-  const locs = pickAll(xml, /<loc>(.*?)<\/loc>/g);
-  const wanted = locs.filter(u =>
-    /store-products-sitemap\.xml|pages-sitemap\.xml|product-.*-sitemap\.xml/i.test(u)
+function ogMeta(html, prop) {
+  const re = new RegExp(
+    `<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["']`,
+    "i"
   );
-
-  const urls = new Set();
-  for (const sm of wanted) {
-    try {
-      const x = await fetchText(sm);
-      pickAll(x, /<loc>(.*?)<\/loc>/g)
-        .filter(u => /\/product-page\//i.test(u))
-        .forEach(u => urls.add(u));
-    } catch {}
-  }
-  return [...urls];
-}
-
-function parseMeta(html, prop) {
-  const re = new RegExp(`<meta[^>]+property=["']${prop}["'][^>]+content=["']([^"']+)["']`, "i");
   const m = html.match(re);
   return m ? m[1] : "";
 }
 
-async function parseProduct(url, full) {
-  if (!full) {
-    // título aproximado a partir del slug
-    const slug = decodeURIComponent(url.split("/product-page/")[1] || url).replace(/[-_]+/g," ");
-    return { url, title: slug.trim(), price: null, image: "" };
-  }
+function normalize(s) {
+  return (s || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+async function getProductImage(url) {
   try {
     const html = await fetchText(url);
-    const title = normalizeTitle(parseMeta(html, "og:title"));
-    const image = parseMeta(html, "og:image") || parseMeta(html, "twitter:image");
-    return { url, title: title || url, price: null, image };
+    // 1) OpenGraph image
+    const og = ogMeta(html, "og:image");
+    if (og) return og;
+    // 2) Wix images dentro del HTML (fallback simple)
+    const m = html.match(/https:\/\/static\.wixstatic\.com\/[^"']+\.(?:jpg|png|webp)/i);
+    return m ? m[0] : "";
   } catch {
-    return { url, title: url, price: null, image: "" };
+    return "";
   }
 }
 
-async function mapLimit(items, limit, fn) {
-  const out = [];
-  let i = 0, active = 0;
-  return await new Promise((resolve) => {
-    const go = async () => {
-      while (active < limit && i < items.length) {
-        const idx = i++, it = items[idx];
-        active++;
-        fn(it).then(v => out[idx] = v).catch(()=> out[idx]=null).finally(() => {
-          active--;
-          if (i >= items.length && active === 0) resolve(out);
-          else go();
-        });
-      }
-    };
-    go();
-  });
-}
-
-export default async function handler(req) {
-  const { searchParams } = new URL(req.url);
-  const max = Math.max(1, Math.min(600, Number(searchParams.get("max")) || 120));
-  const full = (searchParams.get("full") === "1" || searchParams.get("full") === "true");
-
-  let urls = [];
+export default async function handler(req, res) {
+  const t0 = Date.now();
   try {
-    urls = await listProductUrls();
-  } catch (e) {
-    return new Response(JSON.stringify({ ok:false, error:String(e) }), { status:500 });
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    // Parámetros
+    const max = Math.max(1, Math.min(parseInt(url.searchParams.get("max") || "120", 10), 400));
+    const full = url.searchParams.get("full") === "1"; // Si 1, abrimos cada página para sacar imagen (más lento)
+
+    // 1) Tomamos todos los sitemaps del índice
+    const idxXml = await fetchText(ROOT_SITEMAP);
+    let sitemapUrls = xmlLocs(idxXml).filter(u => u.endsWith(".xml"));
+
+    // 2) De esos sitemaps, traemos las URLs de páginas. Filtramos las que lucen a producto.
+    const pageUrls = [];
+    for (const sm of sitemapUrls) {
+      const xml = await fetchText(sm);
+      const locs = xmlLocs(xml);
+      for (const loc of locs) {
+        if (
+          /\/product-page\//i.test(loc) ||
+          /\/store-products/i.test(loc) ||
+          /\/product\//i.test(loc)
+        ) {
+          pageUrls.push(loc);
+        }
+      }
+    }
+
+    // 3) Creamos documentos (limitando por max)
+    const docs = [];
+    const limited = pageUrls.slice(0, max);
+
+    // Para thumbnails sólo si piden full=1 (puede tardar). Fallback: sin imagen.
+    for (let i = 0; i < limited.length; i++) {
+      const url = limited[i];
+      // Un título rápido con la última parte de la URL, por si no hacemos "full"
+      const fallbackTitle = decodeURIComponent(url.split("/").filter(Boolean).pop() || "")
+        .replace(/[-_]/g, " ");
+
+      let image = "";
+      let title = fallbackTitle;
+      let price = null;
+
+      if (full) {
+        // Pedimos la página y sacamos meta og:title / og:image (y si hubiera, el precio)
+        const html = await fetchText(url);
+        title = ogMeta(html, "og:title") || fallbackTitle;
+        image = ogMeta(html, "og:image") || "";
+        const priceMeta = html.match(
+          /<meta[^>]+property=["']product:price:amount["'][^>]+content=["']([^"']+)["']/i
+        );
+        price = priceMeta ? priceMeta[1] : null;
+
+        // Pequeña pausa cada 10 para no saturar
+        if (i % 10 === 9) await sleep(150);
+      }
+
+      docs.push({
+        title: title.trim(),
+        url,
+        price,
+        image,
+        _norm: normalize(title)
+      });
+    }
+
+    // Guardamos en memoria de esta instancia (sirve mientras no cambie de lambda)
+    globalThis.__CATALOGO__ = { docs, updatedAt: Date.now() };
+
+    return res.status(200).json({
+      ok: true,
+      count: docs.length,
+      sample: docs.slice(0, 3).map(({ _norm, ...d }) => d),
+      sitemapCount: sitemapUrls.length,
+      taken: Date.now() - t0,
+      updatedAt: globalThis.__CATALOGO__.updatedAt
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: String(err),
+    });
   }
-  urls = urls.slice(0, max);
-
-  // limitar concurrencia al pedir páginas completas
-  const CONC = full ? 5 : 10;
-  const started = Date.now();
-
-  const docs = (await mapLimit(urls, CONC, u => parseProduct(u, full)))
-    .filter(Boolean);
-
-  globalThis.__ELECTRO_IDX.docs = docs;
-  globalThis.__ELECTRO_IDX.updatedAt = Date.now();
-
-  const sample = docs.slice(0, 3).map(d => ({ title:d.title, url:d.url, price:d.price, image:d.image }));
-
-  return new Response(JSON.stringify({
-    ok: true,
-    count: docs.length,
-    sample,
-    sitemapCount: urls.length,
-    taken: Date.now() - started,
-    updatedAt: globalThis.__ELECTRO_IDX.updatedAt
-  }), { headers:{ "content-type":"application/json" }});
 }
-
-
