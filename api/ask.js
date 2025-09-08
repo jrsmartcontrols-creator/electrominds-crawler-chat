@@ -1,87 +1,140 @@
-// api/ask.js
-import { getIndex, queryIndex, hydrateIndex } from "./reindex.js";
+// /api/ask.js
+// Busca en el índice en memoria creado por /api/reindex.js
+// Añade boost por categorías (breadcrumbs) y filtro por “familias” (arduino, raspberry, etc.)
+// Soporta paginación: ?q=...&limit=12&page=1
 
-const WHATSAPP =
-  "https://wa.me/573203440092?text=Hola%20Electrominds,%20necesito%20asesor%C3%ADa";
+export const config = { runtime: "edge" };
 
-// --- CORS ---
-function setCORS(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+function getStore() {
+  globalThis.__EM_STORE__ ??= { docs: [], updatedAt: 0, byUrl: new Map() };
+  return globalThis.__EM_STORE__;
 }
 
-export default async function handler(req, res) {
-  setCORS(res);
-  if (req.method === "OPTIONS") return res.status(204).end();
+const WA_BASE = "https://wa.me/573203440092?text=";
 
-  try {
-    const src   = req.method === "POST" ? (req.body || {}) : (req.query || {});
-    const q     = String(src.q || "").trim();
-    const limit = Math.max(1, Math.min(parseInt(src.limit ?? 12, 10) || 12, 50));
-    const page  = Math.max(1, parseInt(src.page ?? 1, 10) || 1);
+const NORMALIZE = (s="") =>
+  s.toLowerCase()
+   .normalize("NFD")
+   .replace(/[\u0300-\u036f]/g, "");
 
-    if (!q) {
-      return res.status(400).json({ ok: false, error: "Falta parámetro q" });
-    }
+function scoreDoc(doc, q) {
+  const k = NORMALIZE(q);
+  const title = NORMALIZE(doc.title || "");
+  const text  = NORMALIZE(doc.text || "");
+  const url   = NORMALIZE(doc.url || "");
+  const cats  = (doc.cats || []).map(c => NORMALIZE(String(c)));
 
-    // 1) ¿Índice vacío en esta instancia? → hidratar llamando a /api/reindex?full=1
-    let idx = getIndex();
-    if (!idx?.docs?.length) {
-      try {
-        const base = `https://${req.headers.host}`;
-        const r = await fetch(`${base}/api/reindex?max=400&full=1`, { headers: { "accept": "application/json" } });
-        const j = await r.json();
-        if (j?.ok && Array.isArray(j.docs) && j.docs.length) {
-          hydrateIndex(j.docs);
-          idx = getIndex();
-        }
-      } catch (e) {
-        // si falla, seguimos y devolvemos fallback elegante más abajo
-        console.warn("Hydration fetch failed:", e?.message || e);
-      }
-    }
+  let s = 0;
+  if (title.includes(k)) s += 2.0;
+  if (text.includes(k))  s += 1.0;
+  if (url.includes(k))   s += 0.5;
+  if (cats.some(c => c.includes(k))) s += 2.5; // boost por categorías
 
-    // 2) Si sigue vacío, responder sin romper
-    if (!idx?.docs?.length) {
-      return res.status(200).json({
-        ok: true,
-        found: false,
-        total: 0,
-        page: 1,
-        pages: 1,
-        limit,
-        message: "Índice temporalmente vacío. Intenta de nuevo en unos segundos.",
-        contact_url: WHATSAPP,
-        results: []
-      });
-    }
+  return s;
+}
 
-    // 3) Buscar + paginar
-    const hits   = queryIndex(q);
-    const total  = hits.length;
-    const pages  = Math.max(1, Math.ceil(total / limit));
-    const start  = (page - 1) * limit;
-    const results = hits.slice(start, start + limit);
+function queryIndex(query) {
+  const q = String(query || "").trim();
+  if (!q) return [];
 
-    return res.status(200).json({
-      ok: true,
-      found: results.length > 0,
-      total,
-      page,
-      pages,
-      limit,
-      results,
-      contact_url: WHATSAPP
-    });
-  } catch (err) {
-    console.error("ask.js error:", err);
-    return res.status(200).json({
-      ok: false,
-      error: "server_error",
-      message: "Ocurrió un error y ya lo estamos revisando.",
-      contact_url: WHATSAPP
+  const k = NORMALIZE(q);
+
+  // Familias: si coincide exactamente con una familia,
+  // exigimos match en título o categoría para eliminar ruido.
+  const FAMILY = new Set([
+    "arduino","raspberry","raspberry pi",
+    "interruptor wifi","sensor","sensors","cables vga","cable vga"
+  ]);
+
+  const { docs } = getStore();
+  let scored = docs.map(d => ({ ...d, _score: scoreDoc(d, q) }))
+                   .sort((a,b) => b._score - a._score);
+
+  if (FAMILY.has(k)) {
+    scored = scored.filter(d => {
+      const t = NORMALIZE(d.title || "");
+      const cs = (d.cats || []).map(c => NORMALIZE(String(c)));
+      return t.includes(k) || cs.some(c => c.includes(k));
     });
   }
+
+  // Umbral mínimo para evitar ruido residual
+  scored = scored.filter(d => d._score >= 2);
+
+  return scored;
+}
+
+export default async function handler(req) {
+  const { searchParams } = new URL(req.url);
+  const q = (searchParams.get("q") || "").trim();
+  const limit = Math.max(1, Math.min(50, parseInt(searchParams.get("limit") || "12", 10) || 12));
+  const page  = Math.max(1, parseInt(searchParams.get("page") || "1", 10) || 1);
+
+  const store = getStore();
+  const waDefault = WA_BASE + encodeURIComponent("Hola Electrominds, ¿me ayudas?");
+
+  if (!store.docs.length) {
+    return json({
+      ok: true,
+      found: false,
+      total: 0, page: 1, pages: 1, limit,
+      message: "Índice vacío. Abre /api/reindex primero para cargar el contenido.",
+      contact_url: waDefault,
+      results: []
+    });
+  }
+
+  if (!q) {
+    return json({
+      ok: true,
+      found: false,
+      total: 0, page: 1, pages: 1, limit,
+      message: "Falta parámetro q",
+      contact_url: waDefault,
+      results: []
+    });
+  }
+
+  const all = queryIndex(q);
+  const total = all.length;
+  const pages = Math.max(1, Math.ceil(total / limit));
+  const slice = all.slice((page - 1) * limit, (page - 1) * limit + limit);
+
+  const results = slice.map(r => ({
+    title: r.title,
+    url: r.url,
+    price: r.price ?? null,
+    image: r.image ?? null,
+    cats: r.cats ?? [],
+    score: r._score
+  }));
+
+  const found = results.length > 0;
+
+  // WhatsApp con el interés del usuario (si no hay resultados, link genérico)
+  const wa = found
+    ? WA_BASE + encodeURIComponent(`Hola Electrominds, busqué: "${q}"`)
+    : waDefault;
+
+  return json({
+    ok: true,
+    found,
+    total,
+    page,
+    pages,
+    limit,
+    contact_url: wa,
+    results
+  });
+}
+
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "access-control-allow-origin": "*"
+    }
+  });
 }
 
