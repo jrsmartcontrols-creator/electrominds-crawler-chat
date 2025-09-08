@@ -1,140 +1,84 @@
-// /api/ask.js
-// Busca en el índice en memoria creado por /api/reindex.js
-// Añade boost por categorías (breadcrumbs) y filtro por “familias” (arduino, raspberry, etc.)
-// Soporta paginación: ?q=...&limit=12&page=1
+// api/ask.js
+import { getIndex, queryIndex } from "./reindex.js";
 
-export const config = { runtime: "edge" };
+const WA = "https://wa.me/573203440092";
 
-function getStore() {
-  globalThis.__EM_STORE__ ??= { docs: [], updatedAt: 0, byUrl: new Map() };
-  return globalThis.__EM_STORE__;
+/** Llama a /api/reindex si el índice está vacío y devuelve el índice en memoria */
+async function ensureIndexIsWarm(req) {
+  const idx = getIndex();
+  if (idx?.docs?.length) return idx;
+
+  // Construimos la URL base del mismo deployment
+  const proto = req.headers["x-forwarded-proto"] || "https";
+  const host  = req.headers.host;
+  const base  = `${proto}://${host}`;
+
+  try {
+    // Calentamos con un tamaño seguro para Vercel (evita 504 con 200+)
+    const url = `${base}/api/reindex?max=120`;
+    await fetch(url, { cache: "no-store" }).then(r => r.json()).catch(()=>{});
+  } catch (_) {}
+
+  return getIndex();
 }
 
-const WA_BASE = "https://wa.me/573203440092?text=";
+export default async function handler(req, res) {
+  if (req.method !== "GET") {
+    return res.status(405).json({ ok:false, message:"Solo GET permitido" });
+  }
 
-const NORMALIZE = (s="") =>
-  s.toLowerCase()
-   .normalize("NFD")
-   .replace(/[\u0300-\u036f]/g, "");
+  const qRaw  = (req.query.q ?? "").toString().trim();
+  const page  = Math.max(1, parseInt(req.query.page ?? "1", 10));
+  const limit = Math.min(50, Math.max(1, parseInt(req.query.limit ?? "12", 10)));
 
-function scoreDoc(doc, q) {
-  const k = NORMALIZE(q);
-  const title = NORMALIZE(doc.title || "");
-  const text  = NORMALIZE(doc.text || "");
-  const url   = NORMALIZE(doc.url || "");
-  const cats  = (doc.cats || []).map(c => NORMALIZE(String(c)));
-
-  let s = 0;
-  if (title.includes(k)) s += 2.0;
-  if (text.includes(k))  s += 1.0;
-  if (url.includes(k))   s += 0.5;
-  if (cats.some(c => c.includes(k))) s += 2.5; // boost por categorías
-
-  return s;
-}
-
-function queryIndex(query) {
-  const q = String(query || "").trim();
-  if (!q) return [];
-
-  const k = NORMALIZE(q);
-
-  // Familias: si coincide exactamente con una familia,
-  // exigimos match en título o categoría para eliminar ruido.
-  const FAMILY = new Set([
-    "arduino","raspberry","raspberry pi",
-    "interruptor wifi","sensor","sensors","cables vga","cable vga"
-  ]);
-
-  const { docs } = getStore();
-  let scored = docs.map(d => ({ ...d, _score: scoreDoc(d, q) }))
-                   .sort((a,b) => b._score - a._score);
-
-  if (FAMILY.has(k)) {
-    scored = scored.filter(d => {
-      const t = NORMALIZE(d.title || "");
-      const cs = (d.cats || []).map(c => NORMALIZE(String(c)));
-      return t.includes(k) || cs.some(c => c.includes(k));
+  if (!qRaw) {
+    return res.status(400).json({
+      ok: false,
+      message: "Falta el parámetro q",
+      contact_url: `${WA}?text=${encodeURIComponent("Hola Electrominds, necesito un asesor")}`,
     });
   }
 
-  // Umbral mínimo para evitar ruido residual
-  scored = scored.filter(d => d._score >= 2);
+  // Asegura que haya índice en memoria (si no, lo recalienta)
+  const idx = await ensureIndexIsWarm(req);
 
-  return scored;
-}
-
-export default async function handler(req) {
-  const { searchParams } = new URL(req.url);
-  const q = (searchParams.get("q") || "").trim();
-  const limit = Math.max(1, Math.min(50, parseInt(searchParams.get("limit") || "12", 10) || 12));
-  const page  = Math.max(1, parseInt(searchParams.get("page") || "1", 10) || 1);
-
-  const store = getStore();
-  const waDefault = WA_BASE + encodeURIComponent("Hola Electrominds, ¿me ayudas?");
-
-  if (!store.docs.length) {
-    return json({
+  if (!idx?.docs?.length) {
+    // Si por algún motivo no se pudo calentar, devolvemos fallback amable
+    return res.json({
       ok: true,
       found: false,
-      total: 0, page: 1, pages: 1, limit,
+      total: 0,
+      page,
+      pages: 1,
+      limit,
       message: "Índice vacío. Abre /api/reindex primero para cargar el contenido.",
-      contact_url: waDefault,
+      contact_url: `${WA}?text=${encodeURIComponent("Hola Electrominds, ¿me ayudas?")}`,
       results: []
     });
   }
 
-  if (!q) {
-    return json({
-      ok: true,
-      found: false,
-      total: 0, page: 1, pages: 1, limit,
-      message: "Falta parámetro q",
-      contact_url: waDefault,
-      results: []
-    });
-  }
-
-  const all = queryIndex(q);
-  const total = all.length;
+  // Buscamos
+  const hits  = queryIndex(qRaw, idx);
+  const total = hits.length;
   const pages = Math.max(1, Math.ceil(total / limit));
-  const slice = all.slice((page - 1) * limit, (page - 1) * limit + limit);
+  const start = (page - 1) * limit;
+  const slice = hits.slice(start, start + limit);
 
-  const results = slice.map(r => ({
-    title: r.title,
-    url: r.url,
-    price: r.price ?? null,
-    image: r.image ?? null,
-    cats: r.cats ?? [],
-    score: r._score
+  const results = slice.map(d => ({
+    title: d.title,
+    url:   d.url,
+    image: d.image || null,
+    price: d.price ?? null,
   }));
 
-  const found = results.length > 0;
-
-  // WhatsApp con el interés del usuario (si no hay resultados, link genérico)
-  const wa = found
-    ? WA_BASE + encodeURIComponent(`Hola Electrominds, busqué: "${q}"`)
-    : waDefault;
-
-  return json({
+  return res.json({
     ok: true,
-    found,
+    found: total > 0,
     total,
     page,
     pages,
     limit,
-    contact_url: wa,
+    contact_url: `${WA}?text=${encodeURIComponent("Hola Electrominds, ¿me ayudas?")}`,
     results
   });
 }
-
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "access-control-allow-origin": "*"
-    }
-  });
-}
-
