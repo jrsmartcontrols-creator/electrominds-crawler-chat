@@ -1,63 +1,75 @@
-let lastQuery = "";
-let nextPage = 1;
-let lastPages = 1;
+// api/ask.js
+import { getIndex, queryIndex } from "./reindex.js";
 
-async function ask(q, more=false){
-  if (!more) {
-    lastQuery = String(q||"").trim();
-    nextPage  = 1;
-    lastPages = 1;
-    if (!lastQuery) return;
-    input.value = "";
-    addMsg(esc(lastQuery), "user");
-  }
+const WHATSAPP =
+  "https://wa.me/573203440092?text=Hola%20Electrominds,%20necesito%20asesor%C3%ADa";
 
-  const typing = addTyping();
+// --- CORS ---
+function setCORS(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
 
-  let data = null;
-  try{
-    const url = `${CONFIG.apiBase}/api/ask?q=${encodeURIComponent(lastQuery)}&limit=12&page=${nextPage}`;
-    const resp = await fetch(url, { headers: { "Accept": "application/json" }});
-    const text = await resp.text();
-    try { data = JSON.parse(text); }
-    catch {
-      typing.remove();
-      addMsg(`No pude leer la respuesta del servidor.<br>
-              Intenta de nuevo o contacta un asesor.<br>
-              <a class="emz-btn emz-btn-link" href="${CONFIG.whatsapp}" target="_blank" rel="nofollow">Contactar por WhatsApp</a>`);
-      return;
+export default async function handler(req, res) {
+  setCORS(res);
+  if (req.method === "OPTIONS") return res.status(204).end();
+
+  try {
+    const src = req.method === "POST" ? (req.body || {}) : (req.query || {});
+    const q = String(src.q || "").trim();
+
+    if (!q) {
+      return res.status(400).json({ ok: false, error: "Falta parámetro q" });
     }
-  }catch{
-    typing.remove();
-    addMsg(`No me pude conectar al servidor.<br>
-            Revisa tu conexión e intenta otra vez 🙏<br>
-            <a class="emz-btn emz-btn-link" href="${CONFIG.whatsapp}" target="_blank" rel="nofollow">Contactar por WhatsApp</a>`);
-    return;
-  }
 
-  typing.remove();
-
-  try{
-    if (data?.ok && Array.isArray(data.results) && data.results.length){
-      renderResults(data.results);
-      lastPages = data.pages || 1;
-
-      if (nextPage < lastPages){
-        const moreBtn = document.createElement("button");
-        moreBtn.className = "emz-btn emz-btn-ghost";
-        moreBtn.textContent = "Ver más resultados";
-        moreBtn.onclick = () => { moreBtn.remove(); nextPage++; ask(lastQuery, true); };
-        bodyEl.appendChild(moreBtn);
-        bodyEl.scrollTop = bodyEl.scrollHeight;
-      }
+    // Usar índice en memoria
+    let hits = [];
+    let idx = getIndex();
+    if (idx?.docs?.length) {
+      hits = queryIndex(q);
     } else {
-      const contact = data?.contact_url || CONFIG.whatsapp;
-      const msg = data?.message || "No encontré información sobre eso en nuestra web.";
-      addMsg(`${esc(msg)}<br>
-              <a class="emz-btn emz-btn-link" href="${contact}" target="_blank" rel="nofollow">Contactar por WhatsApp</a>`);
+      // Índice vacío → responde sin romper
+      return res.status(200).json({
+        ok: true,
+        found: false,
+        total: 0,
+        page: 1,
+        pages: 1,
+        limit: 12,
+        message:
+          "Índice vacío. Abre /api/reindex primero para cargar el contenido.",
+        contact_url: WHATSAPP,
+        results: [],
+      });
     }
-  }catch{
-    addMsg(`Ocurrió un error al mostrar los resultados 😅<br>
-            <a class="emz-btn emz-btn-link" href="${CONFIG.whatsapp}" target="_blank" rel="nofollow">Contactar por WhatsApp</a>`);
+
+    // Paginación
+    const limit = Math.max(1, Math.min(parseInt(src.limit ?? 12, 10) || 12, 50));
+    const page = Math.max(1, parseInt(src.page ?? 1, 10) || 1);
+    const total = hits.length;
+    const pages = Math.max(1, Math.ceil(total / limit));
+    const start = (page - 1) * limit;
+    const results = hits.slice(start, start + limit);
+
+    return res.status(200).json({
+      ok: true,
+      found: results.length > 0,
+      total,
+      page,
+      pages,
+      limit,
+      results,
+      contact_url: WHATSAPP,
+    });
+  } catch (err) {
+    console.error("ask.js error:", err);
+    // ¡Nunca devolvemos 500 al front!
+    return res.status(200).json({
+      ok: false,
+      error: "server_error",
+      message: "Ocurrió un error y ya lo estamos revisando.",
+      contact_url: WHATSAPP,
+    });
   }
 }
